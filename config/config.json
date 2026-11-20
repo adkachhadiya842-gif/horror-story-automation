@@ -1,0 +1,60 @@
+
+{
+  "project": {
+    "name": "horror-story-automation",
+    "language": "Hindi",
+    "output_language": "hi-IN"
+  },
+  "video": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 24,
+    "format": "mp4",
+    "image_count": 96,
+    "scene_duration_seconds": 10,
+    "transition_duration": 0.8,
+    "zoom_effect": true,
+    "pan_effect": true
+  },
+  "story": {
+    "preserve_original_plot": true,
+    "preserve_character_names": true,
+    "preserve_dialogues": true,
+    "preserve_story_order": true,
+    "preserve_ending": true,
+    "narration_style": "deep_calm_cinematic_horror",
+    "target_runtime_minutes": 0
+  },
+  "images": {
+    "aspect_ratio": "16:9",
+    "quality": "high",
+    "reference_sheets": true,
+    "character_consistency": true,
+    "location_consistency": true,
+    "entity_consistency": true
+  },
+  "audio": {
+    "voice_generation": true,
+    "voice_language": "hi-IN",
+    "background_ambience": true,
+    "background_music": true,
+    "sound_effects": true
+  },
+  "subtitles": {
+    "enabled": true,
+    "language": "Hindi",
+    "format": "srt",
+    "burn_into_video": true
+  },
+  "thumbnail": {
+    "enabled": true,
+    "width": 1280,
+    "height": 720
+  },
+  "generation": {
+    "image_model": "gemini-2.5-flash-image",
+    "text_model": "gemini-2.5-flash",
+    "max_retries": 3,
+    "retry_delay_seconds": 5
+  }
+}
