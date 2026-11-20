@@ -1,0 +1,10 @@
+
+google-genai
+Pillow
+moviepy
+numpy
+pydub
+srt
+python-dotenv
+requests
+tqdm
