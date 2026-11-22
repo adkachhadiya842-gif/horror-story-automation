@@ -1,89 +1,92 @@
 
+"""
+Cinematic Horror Story - Video Editor
+
+Features:
+- Uses only successful images from the current image generation report.
+- Preserves chronological scene order.
+- Matches total video frames to narration duration.
+- Produces 1920x1080, 24 FPS MP4.
+- Verifies the final video using ffprobe.
+"""
+
 import json
-import subprocess
+import math
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = BASE_DIR / "output"
-IMAGE_DIRS = [
-    OUTPUT_DIR / "images",
-    OUTPUT_DIR / "scenes",
-    OUTPUT_DIR / "visuals",
-]
+
+IMAGE_DIR = OUTPUT_DIR / "images"
 AUDIO_DIR = OUTPUT_DIR / "audio"
+
 TEMP_DIR = OUTPUT_DIR / "temp_video"
+
+ANALYSIS_FILE = OUTPUT_DIR / "story_analysis.json"
+IMAGE_REPORT_FILE = OUTPUT_DIR / "image_generation_report.json"
+
 FINAL_VIDEO = OUTPUT_DIR / "final_video.mp4"
+VIDEO_REPORT = OUTPUT_DIR / "video_report.json"
 
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 24
 
+DURATION_TOLERANCE = 0.15
 
-def run_command(command):
+
+def run_command(command, cwd=None):
     result = subprocess.run(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True
+        text=True,
+        cwd=cwd,
     )
 
     if result.returncode != 0:
         raise RuntimeError(
-            "FFmpeg error:\n" + result.stderr[-4000:]
+            "Command failed:\n"
+            + result.stderr[-5000:]
         )
+
+    return result
 
 
 def find_ffmpeg():
-    try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True
-        )
-    except Exception:
-        raise RuntimeError(
-            "FFmpeg is not installed or is not available in PATH."
-        )
-
-
-def find_story_analysis():
-    possible_files = [
-        OUTPUT_DIR / "story_analysis.json",
-        OUTPUT_DIR / "analysis" / "story_analysis.json"
-    ]
-
-    for path in possible_files:
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as file:
-                return json.load(file)
-
-    return {}
-
-
-def find_images():
-    images = []
-
-    extensions = {".png", ".jpg", ".jpeg", ".webp"}
-
-    for directory in IMAGE_DIRS:
-        if directory.exists():
-            images.extend(
-                file for file in directory.rglob("*")
-                if file.is_file() and file.suffix.lower() in extensions
+    for executable in ("ffmpeg", "ffprobe"):
+        try:
+            subprocess.run(
+                [executable, "-version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
             )
+        except Exception as error:
+            raise RuntimeError(
+                f"{executable} is not installed or not in PATH."
+            ) from error
 
-    # Avoid duplicate paths
-    images = list(dict.fromkeys(images))
 
-    def natural_key(path):
-        return [
-            int(part) if part.isdigit() else part.lower()
-            for part in re.split(r"(\d+)", path.name)
-        ]
+def load_json(path):
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Required file not found: {path}"
+        )
 
-    return sorted(images, key=natural_key)
+    with open(path, "r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Invalid JSON object: {path}"
+        )
+
+    return data
 
 
 def find_audio():
@@ -91,219 +94,444 @@ def find_audio():
         AUDIO_DIR / "final_audio.wav",
         AUDIO_DIR / "narration.wav",
         AUDIO_DIR / "final_audio.mp3",
-        AUDIO_DIR / "narration.mp3"
+        AUDIO_DIR / "narration.mp3",
     ]
 
     for path in candidates:
-        if path.exists():
+        if path.is_file() and path.stat().st_size > 0:
             return path
 
     raise FileNotFoundError(
-        "Narration audio not found in output/audio/"
+        "Narration audio not found in output/audio/. "
+        "Expected final_audio.wav or narration.wav."
     )
 
 
 def get_audio_duration(audio_path):
-    command = [
+    result = run_command([
         "ffprobe",
         "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
-        str(audio_path)
+        str(audio_path),
+    ])
+
+    try:
+        duration = float(result.stdout.strip())
+    except (ValueError, TypeError):
+        raise RuntimeError(
+            "Could not read valid audio duration."
+        )
+
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError(
+            f"Invalid audio duration: {duration}"
+        )
+
+    return duration
+
+
+def get_current_run_images():
+    """
+    Read successful image paths from the current image report.
+    This prevents old images in other folders from being included.
+    """
+
+    report = load_json(IMAGE_REPORT_FILE)
+
+    scene_results = report.get("scene_images", [])
+
+    if not isinstance(scene_results, list):
+        raise ValueError(
+            "Image report does not contain a valid scene_images list."
+        )
+
+    successful = [
+        item
+        for item in scene_results
+        if isinstance(item, dict)
+        and item.get("status") == "success"
+        and item.get("image_path")
     ]
 
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True
+    successful.sort(
+        key=lambda item: int(item.get("image_index", 0))
     )
 
-    if result.returncode != 0:
-        raise RuntimeError("Could not read audio duration.")
+    images = []
 
-    return float(result.stdout.strip())
+    for item in successful:
+        image_path = Path(item["image_path"])
+
+        if not image_path.is_absolute():
+            image_path = BASE_DIR / image_path
+
+        image_path = image_path.resolve()
+
+        # Only allow scene images from output/images.
+        try:
+            image_path.relative_to(IMAGE_DIR.resolve())
+        except ValueError:
+            raise ValueError(
+                "Image report contains an image outside "
+                f"output/images/: {image_path}"
+            )
+
+        if not image_path.is_file():
+            raise FileNotFoundError(
+                f"Reported scene image is missing: {image_path}"
+            )
+
+        images.append({
+            "path": image_path,
+            "scene_number": item.get("scene_number"),
+            "image_index": item.get("image_index"),
+            "story_event": item.get("story_event", ""),
+        })
+
+    if not images:
+        raise FileNotFoundError(
+            "No successful current-run scene images found. "
+            "Check image_generation_report.json."
+        )
+
+    return images
 
 
-def get_scene_text(scene):
-    if isinstance(scene, str):
-        return scene
+def get_scene_weights(images, analysis):
+    """
+    Use original storyboard event descriptions to distribute
+    visual time. These descriptions are not voiceover.
+    """
 
-    if not isinstance(scene, dict):
-        return ""
-
-    for key in [
-        "narration",
-        "voiceover",
-        "text",
-        "description",
-        "script"
-    ]:
-        value = scene.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
-
-    return ""
-
-
-def calculate_scene_durations(analysis, image_count, total_duration):
     scenes = analysis.get("scenes", [])
 
-    if not isinstance(scenes, list) or not scenes:
-        scenes = [{} for _ in range(image_count)]
+    scene_lookup = {}
 
-    # Match available images to scenes.
-    count = min(len(scenes), image_count)
-    scenes = scenes[:count]
+    if isinstance(scenes, list):
+        for scene in scenes:
+            if not isinstance(scene, dict):
+                continue
 
-    # Use supplied scene durations if available.
-    supplied = []
+            scene_number = scene.get("scene_number")
 
-    for scene in scenes:
-        duration = None
+            if scene_number is not None:
+                scene_lookup[str(scene_number)] = scene
 
-        if isinstance(scene, dict):
-            for key in ["duration", "duration_seconds", "estimated_duration"]:
-                try:
-                    value = float(scene.get(key, 0))
-                    if value > 0:
-                        duration = value
-                        break
-                except (TypeError, ValueError):
-                    pass
-
-        supplied.append(duration)
-
-    if all(value is not None for value in supplied):
-        total_supplied = sum(supplied)
-        return [
-            value * total_duration / total_supplied
-            for value in supplied
-        ]
-
-    # Otherwise distribute time according to narration length.
     weights = []
 
-    for scene in scenes:
-        text = get_scene_text(scene)
-        weights.append(max(len(text.strip()), 1))
+    for image in images:
+        scene = scene_lookup.get(
+            str(image.get("scene_number")),
+            {},
+        )
+
+        event_text = (
+            scene.get("story_event")
+            or image.get("story_event")
+            or scene.get("visual_description")
+            or scene.get("scene_title")
+            or ""
+        )
+
+        weight = max(
+            len(str(event_text).strip()),
+            1,
+        )
+
+        weights.append(weight)
+
+    return weights
+
+
+def allocate_frames(weights, total_frames):
+    """
+    Allocate integer frame counts while ensuring the sum
+    is exactly equal to total_frames.
+    """
+
+    if not weights:
+        raise ValueError("Cannot allocate frames without images.")
+
+    if total_frames < len(weights):
+        raise ValueError(
+            "Audio duration is too short for the number of images "
+            "at the selected FPS."
+        )
 
     total_weight = sum(weights)
 
-    return [
-        total_duration * weight / total_weight
+    if total_weight <= 0:
+        weights = [1] * len(weights)
+        total_weight = len(weights)
+
+    exact_allocations = [
+        (weight / total_weight) * total_frames
         for weight in weights
     ]
 
+    allocations = [
+        int(value)
+        for value in exact_allocations
+    ]
 
-def create_scene_clip(image_path, duration, output_path, index):
-    frames = max(1, round(duration * FPS))
+    remaining = total_frames - sum(allocations)
 
-    # Gentle alternating zoom direction.
+    remainders = sorted(
+        range(len(weights)),
+        key=lambda index: (
+            exact_allocations[index] - allocations[index]
+        ),
+        reverse=True,
+    )
+
+    for index in remainders[:remaining]:
+        allocations[index] += 1
+
+    if sum(allocations) != total_frames:
+        raise RuntimeError(
+            "Frame allocation total does not match target."
+        )
+
+    if any(frames <= 0 for frames in allocations):
+        raise RuntimeError(
+            "At least one scene received zero frames."
+        )
+
+    return allocations
+
+
+def create_scene_clip(
+    image_path,
+    frame_count,
+    output_path,
+    index,
+):
+    """
+    Create one cinematic still-image clip.
+    Every clip uses the same resolution and FPS.
+    """
+
     if index % 2 == 0:
         zoom = "min(zoom+0.0005,1.08)"
     else:
-        zoom = "if(lte(zoom,1.0),1.08,max(1.0,zoom-0.0005))"
+        zoom = (
+            "if(lte(zoom,1.0),"
+            "1.08,"
+            "max(1.0,zoom-0.0005))"
+        )
 
     filter_string = (
-        "scale=2200:1238:force_original_aspect_ratio=increase,"
+        "scale=2200:1238:"
+        "force_original_aspect_ratio=increase,"
         "crop=2200:1238,"
         f"zoompan=z='{zoom}':"
         "x='iw/2-(iw/zoom/2)':"
         "y='ih/2-(ih/zoom/2)':"
-        f"d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS},"
-        "setsar=1,format=yuv420p"
+        f"d={frame_count}:"
+        f"s={WIDTH}x{HEIGHT}:"
+        f"fps={FPS},"
+        "setsar=1,"
+        "format=yuv420p"
     )
 
-    command = [
-        "ffmpeg", "-y",
+    run_command([
+        "ffmpeg",
+        "-y",
         "-loop", "1",
         "-i", str(image_path),
         "-vf", filter_string,
-        "-frames:v", str(frames),
+        "-frames:v", str(frame_count),
         "-an",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "20",
-        str(output_path)
-    ]
+        "-pix_fmt", "yuv420p",
+        "-r", str(FPS),
+        str(output_path),
+    ])
 
-    run_command(command)
+
+def get_video_info(video_path):
+    result = run_command([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries",
+        "format=duration:"
+        "stream=codec_type,width,height,r_frame_rate,duration",
+        "-of", "json",
+        str(video_path),
+    ])
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "Could not parse final video information."
+        ) from error
+
+    streams = data.get("streams", [])
+    format_data = data.get("format", {})
+
+    video_stream = next(
+        (
+            stream for stream in streams
+            if stream.get("codec_type") == "video"
+        ),
+        None,
+    )
+
+    audio_stream = next(
+        (
+            stream for stream in streams
+            if stream.get("codec_type") == "audio"
+        ),
+        None,
+    )
+
+    if not video_stream:
+        raise RuntimeError(
+            "Final MP4 does not contain a video stream."
+        )
+
+    if not audio_stream:
+        raise RuntimeError(
+            "Final MP4 does not contain an audio stream."
+        )
+
+    duration = float(
+        format_data.get("duration", 0)
+    )
+
+    return {
+        "duration": duration,
+        "width": int(video_stream.get("width", 0)),
+        "height": int(video_stream.get("height", 0)),
+        "fps": video_stream.get("r_frame_rate"),
+        "has_audio": True,
+    }
 
 
 def create_video():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     find_ffmpeg()
 
-    images = find_images()
-
-    if not images:
-        raise FileNotFoundError(
-            "No scene images found. Expected images inside output/images/"
-        )
+    # Load current run's analysis and image report.
+    analysis = load_json(ANALYSIS_FILE)
+    images = get_current_run_images()
 
     audio_path = find_audio()
-    total_duration = get_audio_duration(audio_path)
+    audio_duration = get_audio_duration(audio_path)
 
-    if total_duration <= 0:
-        raise RuntimeError("Audio duration is invalid.")
-
-    analysis = find_story_analysis()
-
-    durations = calculate_scene_durations(
-        analysis,
-        len(images),
-        total_duration
+    # Use nearest whole video frame to match narration duration.
+    total_frames = round(
+        audio_duration * FPS
     )
 
-    print(f"Found {len(images)} images.")
-    print(f"Audio duration: {total_duration:.2f} seconds.")
-    print("Creating cinematic scene clips...")
+    target_video_duration = total_frames / FPS
+
+    if total_frames <= 0:
+        raise RuntimeError(
+            "Audio duration is too short to create a video."
+        )
+
+    weights = get_scene_weights(
+        images,
+        analysis,
+    )
+
+    frame_allocations = allocate_frames(
+        weights,
+        total_frames,
+    )
+
+    print("--------------------------------------")
+    print("CINEMATIC VIDEO PRODUCTION")
+    print("--------------------------------------")
+    print(f"Scene images: {len(images)}")
+    print(f"Audio duration: {audio_duration:.3f} seconds")
+    print(f"Target video frames: {total_frames}")
+    print(f"Target video duration: {target_video_duration:.3f} seconds")
+    print(f"Resolution: {WIDTH}x{HEIGHT}")
+    print(f"FPS: {FPS}")
+    print("--------------------------------------")
+
+    # Clean temporary clips from previous runs.
+    if TEMP_DIR.exists():
+        shutil.rmtree(TEMP_DIR)
+
+    TEMP_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if FINAL_VIDEO.exists():
+        FINAL_VIDEO.unlink()
 
     clip_paths = []
 
-    for index, (image, duration) in enumerate(
-        zip(images[:len(durations)], durations)
+    for index, (image, frames) in enumerate(
+        zip(images, frame_allocations),
+        start=1,
     ):
-        clip_path = TEMP_DIR / f"scene_{index + 1:04d}.mp4"
+        clip_path = TEMP_DIR / (
+            f"scene_{index:04d}.mp4"
+        )
+
+        duration = frames / FPS
 
         print(
-            f"Rendering scene {index + 1}/{len(durations)} "
-            f"({duration:.1f}s)"
+            f"Rendering scene {index}/{len(images)} "
+            f"| {duration:.2f}s | "
+            f"{frames} frames"
         )
 
         create_scene_clip(
-            image,
-            duration,
+            image["path"],
+            frames,
             clip_path,
-            index
+            index,
         )
 
         clip_paths.append(clip_path)
 
+    # Create a simple concat list in the temp directory.
     concat_file = TEMP_DIR / "concat_list.txt"
 
-    with open(concat_file, "w", encoding="utf-8") as file:
+    with open(
+        concat_file,
+        "w",
+        encoding="utf-8",
+    ) as file:
         for clip in clip_paths:
-            safe_path = clip.resolve().as_posix().replace("'", "'\\''")
-            file.write(f"file '{safe_path}'\n")
+            file.write(
+                f"file '{clip.name}'\n"
+            )
 
     silent_video = TEMP_DIR / "silent_video.mp4"
 
     run_command([
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_file),
         "-c", "copy",
-        str(silent_video)
-    ])
+        "-an",
+        str(silent_video),
+    ], cwd=TEMP_DIR)
 
-    print("Combining video with narration and sound design...")
+    print(
+        "Combining video with narration and sound design..."
+    )
 
     run_command([
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-i", str(silent_video),
         "-i", str(audio_path),
         "-map", "0:v:0",
@@ -311,30 +539,92 @@ def create_video():
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "192k",
-        "-t", str(total_duration),
+        "-t", f"{target_video_duration:.6f}",
         "-movflags", "+faststart",
-        str(FINAL_VIDEO)
+        "-shortest",
+        str(FINAL_VIDEO),
     ])
 
+    if not FINAL_VIDEO.exists() or FINAL_VIDEO.stat().st_size == 0:
+        raise RuntimeError(
+            "Final video was not created correctly."
+        )
+
+    # Verify actual MP4 metadata and duration.
+    video_info = get_video_info(FINAL_VIDEO)
+
+    if (
+        video_info["width"] != WIDTH
+        or video_info["height"] != HEIGHT
+    ):
+        raise RuntimeError(
+            "Final video resolution mismatch: "
+            f"{video_info['width']}x{video_info['height']}"
+        )
+
+    if video_info["fps"] != f"{FPS}/1":
+        raise RuntimeError(
+            f"Final video FPS mismatch: {video_info['fps']}"
+        )
+
+    duration_difference = abs(
+        video_info["duration"] - audio_duration
+    )
+
+    if duration_difference > DURATION_TOLERANCE:
+        raise RuntimeError(
+            "Final video duration does not match narration. "
+            f"Audio: {audio_duration:.3f}s, "
+            f"Video: {video_info['duration']:.3f}s, "
+            f"Difference: {duration_difference:.3f}s"
+        )
+
     report = {
-        "video_file": str(FINAL_VIDEO.relative_to(BASE_DIR)),
+        "video_file": str(
+            FINAL_VIDEO.relative_to(BASE_DIR)
+        ),
         "resolution": f"{WIDTH}x{HEIGHT}",
         "fps": FPS,
-        "image_count": len(images),
-        "audio_file": str(audio_path.relative_to(BASE_DIR)),
-        "duration_seconds": round(total_duration, 2),
-        "status": "completed"
+        "scene_images_used": len(images),
+        "audio_file": str(
+            audio_path.relative_to(BASE_DIR)
+        ),
+        "audio_duration_seconds": round(
+            audio_duration,
+            3,
+        ),
+        "video_duration_seconds": round(
+            video_info["duration"],
+            3,
+        ),
+        "duration_difference_seconds": round(
+            duration_difference,
+            3,
+        ),
+        "total_video_frames": total_frames,
+        "status": "completed",
     }
 
     with open(
-        OUTPUT_DIR / "video_report.json",
+        VIDEO_REPORT,
         "w",
-        encoding="utf-8"
+        encoding="utf-8",
     ) as file:
-        json.dump(report, file, indent=4, ensure_ascii=False)
+        json.dump(
+            report,
+            file,
+            indent=4,
+            ensure_ascii=False,
+        )
 
-    print("\nVIDEO CREATED SUCCESSFULLY")
+    print("\nVIDEO CREATED AND VERIFIED")
     print(f"Output: {FINAL_VIDEO}")
+    print(
+        f"Final duration: {video_info['duration']:.3f} seconds"
+    )
+    print(
+        f"Audio/video difference: {duration_difference:.3f} seconds"
+    )
 
     return FINAL_VIDEO
 
