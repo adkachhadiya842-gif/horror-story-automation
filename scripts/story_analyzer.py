@@ -1,17 +1,19 @@
 
 """
 Hindi Horror Story Automation
-Story Analyzer - Visual Scene Breakdown
+Optimized Story Analyzer - Visual Scene Breakdown
 
 Rules:
-- Original story remains the exact narration source.
+- input/story.txt remains the ONLY narration source.
 - AI is used only for visual analysis.
-- Scene fields are compatible with image_generator.py.
-- Scene count target adapts to story length.
+- Scene fields remain compatible with image_generator.py.
+- Scene count adapts to story length.
+- Gemini gets one attempt before OpenRouter fallback.
 """
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -29,6 +31,7 @@ from scripts.utils import (
     create_project_directories,
 )
 
+
 LOGGER = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -43,7 +46,14 @@ DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini"
 MIN_STORY_CHARACTERS = 300
 MAX_TARGET_SCENES = 60
 MIN_TARGET_SCENES = 12
+
 OUTPUT_TOKENS = 16000
+
+# Require at least 75% of the requested scenes.
+MIN_SCENE_COVERAGE = 0.75
+
+OPENROUTER_TIMEOUT = 240
+MAX_RETRY_WAIT = 120
 
 
 def setup_logging():
@@ -95,22 +105,16 @@ def read_story():
 
 
 def calculate_scene_target(story):
-    """
-    Estimate a useful number of visual scenes from story length.
-
-    This is a target for AI analysis, not a guarantee.
-    """
+    """Calculate visual scene target from original story length."""
 
     story_length = len(story.strip())
 
     estimated = round(story_length / 180)
 
-    target = max(
+    return max(
         MIN_TARGET_SCENES,
         min(estimated, MAX_TARGET_SCENES),
     )
-
-    return target
 
 
 def get_generation_settings(config):
@@ -128,19 +132,32 @@ def get_generation_settings(config):
             generation.get("openrouter_text_model")
             or DEFAULT_OPENROUTER_MODEL
         ),
-        "max_retries": max(
-            1,
-            min(int(generation.get("max_retries", 3)), 5),
-        ),
         "retry_delay": max(
-            1,
+            5,
             int(generation.get("retry_delay_seconds", 5)),
         ),
     }
 
 
-def build_analysis_prompt(story, target_scenes):
-    """Create the complete visual analysis prompt."""
+def build_analysis_prompt(story, target_scenes, retry=False):
+    """
+    Build a compact storyboard prompt.
+
+    Short scene descriptions reduce output size while retaining
+    the fields required by image_generator.py.
+    """
+
+    retry_instruction = ""
+
+    if retry:
+        retry_instruction = f"""
+IMPORTANT RETRY REQUIREMENT:
+The previous response did not satisfy the scene coverage requirement.
+Return at least {math.ceil(target_scenes * MIN_SCENE_COVERAGE)}
+valid scenes, aiming for exactly {target_scenes}.
+Keep each scene description concise.
+Do not omit important events or the ending.
+"""
 
     return f"""
 You are a professional Hindi horror film director,
@@ -148,185 +165,139 @@ storyboard artist and visual continuity supervisor.
 
 Analyze the COMPLETE original Hindi horror story below.
 
-YOUR JOB:
-Create a detailed chronological visual storyboard
-for cinematic image generation.
+YOUR TASK:
+Create a chronological visual storyboard for cinematic image generation.
 
-IMPORTANT STORY PRESERVATION RULES:
+STORY PRESERVATION:
+1. Preserve all original character names and relationships.
+2. Preserve the exact chronological event order.
+3. Preserve important events, reveals, dialogues and the ending.
+4. Do not invent characters, locations, subplots or events.
+5. Do not rewrite or shorten the original story.
+6. Scene narration is only a visual reference.
+7. The original input story independently supplies the voiceover.
 
-1. Preserve every original character name.
-2. Preserve all character relationships.
-3. Preserve the exact chronological story order.
-4. Preserve all important events and reveals.
-5. Do not invent characters.
-6. Do not invent locations or subplots.
-7. Do not change the ending.
-8. Do not change the meaning of any dialogue.
-9. Do not add events that are not in the original story.
-10. Do not rewrite or shorten the original story.
-11. Do not generate the final voiceover.
-12. Scene narration is only a visual reference.
-13. The original story will independently be used for voiceover.
+SCENE REQUIREMENTS:
+Target scene count: {target_scenes}
+Aim for exactly {target_scenes} scenes.
+Minimum acceptable scene count: {math.ceil(target_scenes * MIN_SCENE_COVERAGE)}.
 
-SCENE BREAKDOWN:
+Create one scene for each distinct important visual moment.
+Cover the beginning, middle, suspenseful discoveries, supernatural
+events, important reactions, twists and ending.
 
-TARGET SCENE COUNT: approximately {target_scenes} scenes.
+Do not combine unrelated events.
+Do not create duplicate scenes merely to increase scene count.
+Do not omit important story events to save output space.
 
-Create approximately {target_scenes} chronological visual scenes.
-A reasonable variation is acceptable when the story requires it.
-
-Do not force duplicate scenes just to reach the target.
-
-Create a new scene whenever an important visual moment changes, such as:
-
-- A new location or time.
-- A character entering or leaving.
-- An important action.
-- A significant facial expression or reaction.
-- A suspenseful discovery.
-- A supernatural appearance.
-- An important object being revealed.
-- A major dialogue moment that has a distinct visual.
-- A change in danger, emotion or atmosphere.
-- A major twist or ending reveal.
-
-Do not combine several unrelated events into one image.
-
-Each scene must represent ONE clear visual moment.
-
-For every scene:
-- Write a detailed visual description.
-- Specify characters physically visible.
-- Specify the location.
-- Specify the camera angle.
-- Specify lighting and atmosphere.
-- Preserve recurring character appearances.
-- Preserve recurring location details.
-- Do not invent visual facts that are not supported by the story.
+OUTPUT EFFICIENCY:
+- Keep each scene concise but visually useful.
+- visual_description: approximately 1-2 sentences.
+- image_prompt: approximately 30-60 English words.
+- story_event: one concise sentence.
+- narration: short visual reference, not voiceover.
+- Avoid repeating long character descriptions in every scene.
+- Use visual_consistency_notes to preserve recurring details.
 
 CHARACTER CONTINUITY:
-
-For each recurring character, provide:
-- Exact name.
-- Age only if stated or clearly established.
-- Physical appearance.
-- Hairstyle and facial details when supported.
-- Clothing.
-- Role in the original story.
-- Visual consistency notes.
+For every important recurring character provide:
+name, age if known, appearance, clothing, personality if established,
+role and visual_consistency_notes.
 
 LOCATION CONTINUITY:
-
-For each recurring location, provide:
-- Exact location name.
-- Architecture and environment.
-- Atmosphere.
-- Lighting.
-- Recurring visual details.
+For every recurring location provide:
+name, description, atmosphere, lighting and visual_consistency_notes.
 
 ENTITY CONTINUITY:
+For every supernatural entity provide:
+name, description, behavior and visual_consistency_notes.
 
-For each supernatural entity, provide:
-- Name or story-supported identity.
-- Physical appearance.
-- Clothing if described.
-- Behavior.
-- Distinctive visual characteristics.
+Do not assume two similar entities are identical unless the story
+establishes that connection.
+Do not invent details that are not supported by the story.
 
-IMPORTANT:
-Do not assume that two similar-looking entities are the same
-unless the story establishes that connection.
+RETURN ONLY VALID JSON.
+No Markdown fences. No explanations outside JSON.
 
-OUTPUT FORMAT:
-
-Return ONLY valid JSON.
-Do not use Markdown code fences.
-Do not add explanations outside JSON.
-
-Use this exact structure:
+Use this exact JSON structure:
 
 {{
-  "title": "Original story title",
+  "title": "Story title",
   "language": "Hindi",
   "genre": "Horror",
-  "story_summary": "Short production reference summary",
-  "ending_summary": "Summary of the actual original ending",
-
+  "story_summary": "Short production summary",
+  "ending_summary": "Actual original ending",
   "characters": [
     {{
-      "name": "Exact character name",
-      "age": "Age if known",
+      "name": "Exact name",
+      "age": "Known age or Not specified",
       "appearance": "Physical appearance",
-      "clothing": "Clothing details",
-      "personality": "Personality if established",
-      "role": "Role in the story",
-      "visual_consistency_notes": "Details to preserve"
+      "clothing": "Clothing",
+      "personality": "Established personality",
+      "role": "Story role",
+      "visual_consistency_notes": "Recurring visual details"
     }}
   ],
-
   "locations": [
     {{
-      "name": "Exact location name",
+      "name": "Exact location",
       "description": "Environment and architecture",
-      "atmosphere": "Mood and environment",
-      "lighting": "Lighting details",
-      "visual_consistency_notes": "Recurring location details"
+      "atmosphere": "Mood",
+      "lighting": "Lighting",
+      "visual_consistency_notes": "Recurring details"
     }}
   ],
-
   "entities": [
     {{
       "name": "Entity name",
       "description": "Physical appearance",
-      "behavior": "Behavior in the story",
-      "visual_consistency_notes": "Details to preserve"
+      "behavior": "Behavior",
+      "visual_consistency_notes": "Distinctive details"
     }}
   ],
-
   "scenes": [
     {{
       "scene_number": 1,
-      "scene_title": "Short scene title",
-      "story_event": "Exact event represented in this scene",
-      "narration": "Short visual reference only",
-      "visual_description": "Detailed cinematic visual description",
-      "image_prompt": "Detailed English image-generation prompt",
+      "scene_title": "Short title",
+      "story_event": "Actual event in the story",
+      "narration": "Short visual reference",
+      "visual_description": "Visible cinematic details",
+      "image_prompt": "Detailed English image prompt",
       "characters_present": ["Exact character names"],
-      "entities_present": ["Entity names if visible"],
+      "entities_present": ["Visible entities"],
       "location": "Exact location name",
-      "camera_angle": "Cinematic camera angle",
-      "lighting": "Lighting details",
-      "atmosphere": "Scene atmosphere",
-      "visual_consistency_notes": "Details to preserve"
+      "camera_angle": "Camera angle",
+      "lighting": "Lighting",
+      "atmosphere": "Scene mood",
+      "visual_consistency_notes": "Continuity details"
     }}
   ]
 }}
 
 FIELD RULES:
+- Every scene must contain all fields shown above.
+- characters_present and entities_present must be arrays.
+- location and every other scene field must be a string.
+- Use sequential scene_number values starting at 1.
+- Use consistent spelling of character names.
+- Describe only what is visually supported by the story.
+- Unknown details should use neutral descriptions.
+- Every important story event must receive visual coverage.
+- Give the ending sufficient visual coverage.
 
-- characters_present must be a JSON array.
-- entities_present must be a JSON array.
-- location must be a string.
-- story_event must describe the actual story event.
-- visual_description must describe only what is visible.
-- Do not use invented character names.
-- Use the same spelling of character names in every scene.
-- Keep scene numbers sequential starting from 1.
-- Every important story event must appear in the storyboard.
-- The ending must receive sufficient visual coverage.
+{retry_instruction}
 
-If a detail is unknown, use a neutral description.
-Do not invent specific factual details.
-
-COMPLETE ORIGINAL STORY STARTS:
+COMPLETE ORIGINAL STORY:
 
 {story}
 
-COMPLETE ORIGINAL STORY ENDS.
+END OF ORIGINAL STORY.
 """
 
 
 def extract_json(response_text):
+    """Extract one valid JSON object from model response."""
+
     if (
         not isinstance(response_text, str)
         or not response_text.strip()
@@ -349,14 +320,24 @@ def extract_json(response_text):
     )
 
     start = text.find("{")
-    end = text.rfind("}")
 
-    if start == -1 or end == -1 or end <= start:
+    if start == -1:
         raise ValueError(
             "AI response does not contain a JSON object."
         )
 
-    parsed = json.loads(text[start:end + 1])
+    decoder = json.JSONDecoder()
+
+    try:
+        parsed, end_position = decoder.raw_decode(
+            text[start:]
+        )
+
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "AI returned malformed or truncated JSON: "
+            f"{error}"
+        ) from error
 
     if not isinstance(parsed, dict):
         raise ValueError(
@@ -404,8 +385,73 @@ def normalize_name_list(value):
     return names
 
 
+def normalize_reference_items(items, item_type):
+    """Normalize character, location and entity reference lists."""
+
+    if not isinstance(items, list):
+        items = []
+
+    normalized = []
+
+    for item in items:
+
+        if not isinstance(item, dict):
+            continue
+
+        item = dict(item)
+
+        name = normalize_string(item.get("name"))
+
+        if not name:
+            continue
+
+        item["name"] = name
+
+        if item_type == "character":
+
+            if not item.get("appearance"):
+                item["appearance"] = item.get(
+                    "description",
+                    "",
+                )
+
+            defaults = {
+                "age": "Not specified",
+                "clothing": "",
+                "personality": "",
+                "role": "",
+                "visual_consistency_notes": "",
+            }
+
+        elif item_type == "location":
+
+            defaults = {
+                "description": "",
+                "atmosphere": "",
+                "lighting": "",
+                "visual_consistency_notes": "",
+            }
+
+        else:
+
+            defaults = {
+                "description": "",
+                "behavior": "",
+                "visual_consistency_notes": "",
+            }
+
+        for key, default_value in defaults.items():
+            item[key] = normalize_string(
+                item.get(key, default_value)
+            )
+
+        normalized.append(item)
+
+    return normalized
+
+
 def normalize_analysis(analysis, target_scenes):
-    """Normalize AI response to match image_generator.py."""
+    """Normalize and validate the storyboard structure."""
 
     if not isinstance(analysis, dict):
         raise ValueError(
@@ -419,117 +465,40 @@ def normalize_analysis(analysis, target_scenes):
             "AI did not return any visual scenes."
         )
 
-    # Normalize character reference data.
-    characters = analysis.get("characters", [])
-
-    if not isinstance(characters, list):
-        characters = []
-
-    normalized_characters = []
-
-    for character in characters:
-        if not isinstance(character, dict):
-            continue
-
-        name = normalize_string(character.get("name"))
-
-        if not name:
-            continue
-
-        character["name"] = name
-
-        if not character.get("appearance"):
-            character["appearance"] = (
-                character.get("description", "")
-            )
-
-        character.setdefault("age", "Not specified")
-        character.setdefault("clothing", "")
-        character.setdefault("personality", "")
-        character.setdefault("role", "")
-        character.setdefault("visual_consistency_notes", "")
-
-        normalized_characters.append(character)
-
-    # Normalize locations.
-    locations = analysis.get("locations", [])
-
-    if not isinstance(locations, list):
-        locations = []
-
-    normalized_locations = []
-
-    for location in locations:
-        if not isinstance(location, dict):
-            continue
-
-        name = normalize_string(location.get("name"))
-
-        if not name:
-            continue
-
-        location["name"] = name
-        location.setdefault("description", "")
-        location.setdefault("atmosphere", "")
-        location.setdefault("lighting", "")
-        location.setdefault("visual_consistency_notes", "")
-
-        normalized_locations.append(location)
-
-    # Normalize entities.
-    entities = analysis.get("entities", [])
-
-    if not isinstance(entities, list):
-        entities = []
-
-    normalized_entities = []
-
-    for entity in entities:
-        if not isinstance(entity, dict):
-            continue
-
-        name = normalize_string(entity.get("name"))
-
-        if not name:
-            continue
-
-        entity["name"] = name
-        entity.setdefault("description", "")
-        entity.setdefault("behavior", "")
-        entity.setdefault("visual_consistency_notes", "")
-
-        normalized_entities.append(entity)
-
     normalized_scenes = []
 
-    for index, scene in enumerate(scenes, start=1):
+    required_string_fields = (
+        "scene_title",
+        "story_event",
+        "narration",
+        "visual_description",
+        "image_prompt",
+        "location",
+        "camera_angle",
+        "lighting",
+        "atmosphere",
+        "visual_consistency_notes",
+    )
+
+    for scene in scenes:
+
         if not isinstance(scene, dict):
-            LOGGER.warning(
-                "Ignoring invalid scene at position %s",
-                index,
-            )
             continue
 
-        scene["scene_number"] = index
+        scene = dict(scene)
 
-        # Support the previous analyzer's field names.
+        # Support older field names.
         if not scene.get("characters_present"):
-            scene["characters_present"] = (
-                scene.get("characters", [])
+            scene["characters_present"] = scene.get(
+                "characters",
+                [],
             )
 
-        scene["characters_present"] = normalize_name_list(
-            scene.get("characters_present")
-        )
-
-        scene["entities_present"] = normalize_name_list(
-            scene.get("entities_present")
-            or scene.get("entities")
-        )
-
-        scene["location"] = normalize_string(
-            scene.get("location")
-        )
+        if not scene.get("entities_present"):
+            scene["entities_present"] = scene.get(
+                "entities",
+                [],
+            )
 
         if not scene.get("story_event"):
             scene["story_event"] = (
@@ -548,20 +517,54 @@ def normalize_analysis(analysis, target_scenes):
             )
 
         if not scene.get("image_prompt"):
-            scene["image_prompt"] = (
-                scene.get("visual_description", "")
+            scene["image_prompt"] = scene.get(
+                "visual_description",
+                "",
             )
 
         if not scene.get("narration"):
-            scene["narration"] = (
-                scene.get("visual_description", "")
+            scene["narration"] = scene.get(
+                "visual_description",
+                "",
             )
 
-        scene.setdefault("scene_title", f"Scene {index}")
-        scene.setdefault("camera_angle", "Cinematic wide shot")
-        scene.setdefault("lighting", "Atmospheric cinematic lighting")
-        scene.setdefault("atmosphere", "Suspenseful horror atmosphere")
-        scene.setdefault("visual_consistency_notes", "")
+        defaults = {
+            "scene_title": "Visual scene",
+            "story_event": "",
+            "narration": "",
+            "visual_description": "",
+            "image_prompt": "",
+            "location": "Not specified",
+            "camera_angle": "Cinematic wide shot",
+            "lighting": "Atmospheric cinematic lighting",
+            "atmosphere": "Suspenseful horror atmosphere",
+            "visual_consistency_notes": "",
+        }
+
+        for key, default_value in defaults.items():
+            scene[key] = normalize_string(
+                scene.get(key, default_value)
+            )
+
+        # Reject scenes without useful visual information.
+        if (
+            not scene["visual_description"]
+            or not scene["image_prompt"]
+        ):
+            LOGGER.warning(
+                "Skipping scene with missing visual description."
+            )
+            continue
+
+        scene["characters_present"] = normalize_name_list(
+            scene.get("characters_present")
+        )
+
+        scene["entities_present"] = normalize_name_list(
+            scene.get("entities_present")
+        )
+
+        scene["scene_number"] = len(normalized_scenes) + 1
 
         normalized_scenes.append(scene)
 
@@ -570,29 +573,70 @@ def normalize_analysis(analysis, target_scenes):
             "No valid visual scenes were returned."
         )
 
-    analysis["scenes"] = normalized_scenes
-    analysis["total_scenes"] = len(normalized_scenes)
-    analysis["target_scenes"] = target_scenes
+    minimum_scenes = math.ceil(
+        target_scenes * MIN_SCENE_COVERAGE
+    )
 
-    analysis["characters"] = normalized_characters
-    analysis["locations"] = normalized_locations
-    analysis["entities"] = normalized_entities
-
-    analysis.setdefault("title", "Untitled Horror Story")
-    analysis.setdefault("language", "Hindi")
-    analysis.setdefault("genre", "Horror")
-    analysis.setdefault("story_summary", "")
-    analysis.setdefault("ending_summary", "")
-
-    if len(normalized_scenes) < target_scenes * 0.65:
-        LOGGER.warning(
-            "AI returned fewer scenes than expected. "
-            "Target: %s | Returned: %s",
-            target_scenes,
-            len(normalized_scenes),
+    if len(normalized_scenes) < minimum_scenes:
+        raise ValueError(
+            "Storyboard scene coverage is insufficient. "
+            f"Target: {target_scenes}; "
+            f"Minimum required: {minimum_scenes}; "
+            f"Returned: {len(normalized_scenes)}."
         )
 
-    return analysis
+    characters = normalize_reference_items(
+        analysis.get("characters", []),
+        "character",
+    )
+
+    locations = normalize_reference_items(
+        analysis.get("locations", []),
+        "location",
+    )
+
+    entities = normalize_reference_items(
+        analysis.get("entities", []),
+        "entity",
+    )
+
+    result = dict(analysis)
+
+    result["scenes"] = normalized_scenes
+    result["total_scenes"] = len(normalized_scenes)
+    result["target_scenes"] = target_scenes
+
+    result["characters"] = characters
+    result["locations"] = locations
+    result["entities"] = entities
+
+    result["title"] = normalize_string(
+        result.get("title") or "Untitled Horror Story"
+    )
+
+    result["language"] = normalize_string(
+        result.get("language") or "Hindi"
+    )
+
+    result["genre"] = normalize_string(
+        result.get("genre") or "Horror"
+    )
+
+    result["story_summary"] = normalize_string(
+        result.get("story_summary")
+    )
+
+    result["ending_summary"] = normalize_string(
+        result.get("ending_summary")
+    )
+
+    LOGGER.info(
+        "Storyboard validation passed: %s/%s scenes.",
+        len(normalized_scenes),
+        target_scenes,
+    )
+
+    return result
 
 
 def generate_with_gemini(prompt, model):
@@ -602,6 +646,11 @@ def generate_with_gemini(prompt, model):
         raise ValueError("GEMINI_API_KEY is missing.")
 
     client = genai.Client(api_key=api_key)
+
+    LOGGER.info(
+        "Sending one Gemini storyboard request using %s.",
+        model,
+    )
 
     response = client.models.generate_content(
         model=model,
@@ -621,6 +670,48 @@ def generate_with_gemini(prompt, model):
     return response.text
 
 
+def get_http_status(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code
+
+    status = getattr(error, "status_code", None)
+
+    if status is None:
+        status = getattr(error, "status", None)
+
+    try:
+        return int(status)
+    except (ValueError, TypeError):
+        pass
+
+    match = re.search(
+        r"\b(408|429|500|502|503|504)\b",
+        str(error),
+    )
+
+    return int(match.group(1)) if match else None
+
+
+def is_retryable_openrouter_error(error):
+    status = get_http_status(error)
+
+    if status in (408, 429, 500, 502, 503, 504):
+        return True
+
+    message = str(error).lower()
+
+    return any(
+        phrase in message
+        for phrase in (
+            "timed out",
+            "timeout",
+            "connection reset",
+            "temporarily unavailable",
+            "connection error",
+        )
+    )
+
+
 def generate_with_openrouter(prompt, model):
     api_key = os.getenv(
         "OPENROUTER_API_KEY",
@@ -638,10 +729,13 @@ def generate_with_openrouter(prompt, model):
             {
                 "role": "system",
                 "content": (
-                    "You are a professional horror storyboard artist. "
-                    "Return only valid JSON. Follow the exact requested "
-                    "schema. Preserve the original story and chronology. "
-                    "Do not invent story events."
+                    "You are a professional Hindi horror storyboard artist. "
+                    "Return only one complete valid JSON object. "
+                    "Follow the requested schema exactly. "
+                    "Create the requested number of concise scenes. "
+                    "Preserve original story chronology and ending. "
+                    "Never invent story events. "
+                    "Do not truncate the JSON."
                 ),
             },
             {
@@ -671,13 +765,15 @@ def generate_with_openrouter(prompt, model):
     try:
         with urllib.request.urlopen(
             request,
-            timeout=300,
+            timeout=OPENROUTER_TIMEOUT,
         ) as response:
+
             response_data = json.loads(
                 response.read().decode("utf-8")
             )
 
     except urllib.error.HTTPError as error:
+
         error_body = error.read().decode(
             "utf-8",
             errors="replace",
@@ -685,7 +781,7 @@ def generate_with_openrouter(prompt, model):
 
         raise RuntimeError(
             f"OpenRouter HTTP {error.code}: "
-            f"{error_body[:1500]}"
+            f"{error_body[:1200]}"
         ) from error
 
     choices = response_data.get("choices", [])
@@ -695,7 +791,8 @@ def generate_with_openrouter(prompt, model):
             "OpenRouter returned no choices."
         )
 
-    message = choices[0].get("message", {})
+    choice = choices[0]
+    message = choice.get("message", {})
     content = message.get("content")
 
     if isinstance(content, list):
@@ -710,7 +807,7 @@ def generate_with_openrouter(prompt, model):
             "OpenRouter returned empty analysis content."
         )
 
-    finish_reason = choices[0].get("finish_reason")
+    finish_reason = choice.get("finish_reason")
 
     if finish_reason == "length":
         raise RuntimeError(
@@ -721,22 +818,32 @@ def generate_with_openrouter(prompt, model):
 
 
 def save_analysis(analysis):
+    """Save only a fully validated analysis."""
+
     OUTPUT_ROOT.mkdir(
         parents=True,
         exist_ok=True,
     )
 
+    temporary_file = ANALYSIS_FILE.with_suffix(
+        ".temporary.json"
+    )
+
     with open(
-        ANALYSIS_FILE,
+        temporary_file,
         "w",
         encoding="utf-8",
     ) as file:
+
         json.dump(
             analysis,
             file,
             ensure_ascii=False,
             indent=2,
         )
+
+    # Atomic replacement prevents partial JSON files.
+    temporary_file.replace(ANALYSIS_FILE)
 
     LOGGER.info(
         "Story analysis saved: %s",
@@ -761,78 +868,83 @@ def analyze_story():
         target_scenes,
     )
 
-    prompt = build_analysis_prompt(
-        original_story,
-        target_scenes,
-    )
-
     analysis = None
     provider_used = None
     model_used = None
-    last_error = None
+    errors = []
 
-    # First provider: Gemini.
-    for attempt in range(
-        1,
-        settings["max_retries"] + 1,
-    ):
-        try:
-            LOGGER.info(
-                "Gemini analysis attempt %s/%s",
-                attempt,
-                settings["max_retries"],
-            )
+    # -------------------------------------------------
+    # STEP 1: GEMINI - ONE ATTEMPT
+    # -------------------------------------------------
 
-            response_text = generate_with_gemini(
-                prompt,
-                settings["gemini_model"],
-            )
-
-            parsed = extract_json(response_text)
-
-            analysis = normalize_analysis(
-                parsed,
-                target_scenes,
-            )
-
-            provider_used = "Gemini"
-            model_used = settings["gemini_model"]
-
-            break
-
-        except Exception as error:
-            last_error = error
-
-            LOGGER.warning(
-                "Gemini attempt %s failed: %s",
-                attempt,
-                error,
-            )
-
-            if attempt < settings["max_retries"]:
-                time.sleep(
-                    settings["retry_delay"]
-                )
-
-    # Second provider: OpenRouter fallback.
-    if analysis is None:
-        LOGGER.warning(
-            "Gemini failed. Trying OpenRouter fallback."
+    try:
+        LOGGER.info(
+            "Starting Gemini analysis. Maximum attempts: 1"
         )
+
+        prompt = build_analysis_prompt(
+            original_story,
+            target_scenes,
+        )
+
+        response_text = generate_with_gemini(
+            prompt,
+            settings["gemini_model"],
+        )
+
+        parsed = extract_json(response_text)
+
+        analysis = normalize_analysis(
+            parsed,
+            target_scenes,
+        )
+
+        provider_used = "Gemini"
+        model_used = settings["gemini_model"]
+
+    except Exception as error:
+
+        errors.append(
+            f"Gemini: {error}"
+        )
+
+        LOGGER.warning(
+            "Gemini analysis failed. Switching to OpenRouter: %s",
+            error,
+        )
+
+    # -------------------------------------------------
+    # STEP 2: OPENROUTER FALLBACK
+    # -------------------------------------------------
+
+    if analysis is None:
+
+        LOGGER.info(
+            "Starting OpenRouter fallback."
+        )
+
+        maximum_attempts = 2
 
         for attempt in range(
             1,
-            settings["max_retries"] + 1,
+            maximum_attempts + 1,
         ):
+
             try:
                 LOGGER.info(
-                    "OpenRouter attempt %s/%s",
+                    "OpenRouter analysis attempt %s/%s",
                     attempt,
-                    settings["max_retries"],
+                    maximum_attempts,
+                )
+
+                retry_prompt = build_analysis_prompt(
+                    original_story,
+                    target_scenes,
+                    retry=(attempt > 1),
                 )
 
                 response_text = generate_with_openrouter(
-                    prompt,
+                    retry_prompt,
                     settings["openrouter_model"],
                 )
 
@@ -849,7 +961,10 @@ def analyze_story():
                 break
 
             except Exception as error:
-                last_error = error
+
+                errors.append(
+                    f"OpenRouter attempt {attempt}: {error}"
+                )
 
                 LOGGER.warning(
                     "OpenRouter attempt %s failed: %s",
@@ -857,19 +972,50 @@ def analyze_story():
                     error,
                 )
 
-                if attempt < settings["max_retries"]:
-                    time.sleep(
-                        settings["retry_delay"]
+                if attempt >= maximum_attempts:
+                    break
+
+                if is_retryable_openrouter_error(error):
+
+                    status = get_http_status(error)
+
+                    wait_seconds = min(
+                        settings["retry_delay"] * (2 ** attempt),
+                        MAX_RETRY_WAIT,
                     )
+
+                    if status == 429:
+                        wait_seconds = max(
+                            wait_seconds,
+                            30,
+                        )
+
+                    LOGGER.warning(
+                        "Temporary OpenRouter error. "
+                        "Retrying after %s seconds.",
+                        wait_seconds,
+                    )
+
+                    time.sleep(wait_seconds)
+
+                else:
+                    # Retry once with the compact retry prompt.
+                    LOGGER.info(
+                        "Retrying OpenRouter with stricter "
+                        "scene coverage instructions."
+                    )
+
+    # -------------------------------------------------
+    # STEP 3: FINAL VALIDATION
+    # -------------------------------------------------
 
     if analysis is None:
         raise RuntimeError(
-            "Both AI providers failed to analyze the story. "
-            f"Last error: {last_error}"
+            "Story analysis failed with all providers. "
+            + " | ".join(errors)
         )
 
-    # Original story is always the source of narration.
-    # AI-generated summaries never replace this text.
+    # The original story remains the narration source.
     analysis["original_story"] = original_story
     analysis["narration_script"] = original_story
     analysis["narration_source"] = "input/story.txt"
@@ -887,15 +1033,24 @@ def analyze_story():
     analysis["analysis_provider"] = provider_used
     analysis["analysis_model"] = model_used
 
+    analysis["total_scenes"] = len(
+        analysis["scenes"]
+    )
+
+    analysis["target_scenes"] = target_scenes
+
     save_analysis(analysis)
 
     LOGGER.info("--------------------------------------")
     LOGGER.info("STORY ANALYSIS COMPLETED")
     LOGGER.info("Title: %s", analysis.get("title"))
     LOGGER.info("Target scenes: %s", target_scenes)
-    LOGGER.info("Actual scenes: %s", analysis.get("total_scenes"))
+    LOGGER.info("Actual scenes: %s", analysis["total_scenes"])
     LOGGER.info("Original characters: %s", len(original_story))
-    LOGGER.info("Narration characters: %s", len(analysis["narration_script"]))
+    LOGGER.info(
+        "Narration characters: %s",
+        len(analysis["narration_script"]),
+    )
     LOGGER.info("Provider: %s", provider_used)
     LOGGER.info("Model: %s", model_used)
     LOGGER.info("--------------------------------------")
@@ -907,13 +1062,14 @@ def main():
     setup_logging()
 
     LOGGER.info(
-        "Starting Hindi horror story analysis."
+        "Starting optimized Hindi horror story analysis."
     )
 
     analyze_story()
 
 
 if __name__ == "__main__":
+
     try:
         main()
 
