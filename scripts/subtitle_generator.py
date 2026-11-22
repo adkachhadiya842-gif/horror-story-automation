@@ -3,12 +3,10 @@
 Hindi Horror Story Automation
 Subtitle Generator
 
-Creates SRT subtitles from Hindi narration text
+Creates readable SRT subtitles from Hindi narration text
 and generated WAV audio.
 
-Note:
-Subtitle timestamps are estimated in V1.
-They are not word-level forced alignment.
+Timing is estimated, not word-level forced alignment.
 """
 
 import json
@@ -35,16 +33,25 @@ SRT_FILE = SUBTITLE_DIR / "narration.srt"
 REPORT_FILE = SUBTITLE_DIR / "subtitle_report.json"
 
 
-# Subtitle settings
+# --------------------------------------------------
+# SETTINGS
+# --------------------------------------------------
+
 MAX_CHARS_PER_LINE = 42
 MAX_LINES_PER_SUBTITLE = 2
+
 MIN_SUBTITLE_DURATION = 1.2
 MAX_SUBTITLE_DURATION = 6.0
 
+TARGET_CHARACTERS_PER_SECOND = 16.0
+SENTENCE_PAUSE_FACTOR = 1.12
+
+
+# --------------------------------------------------
+# LOGGING
+# --------------------------------------------------
 
 def setup_logging():
-    """Configure subtitle generator logging."""
-
     SUBTITLE_DIR.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
@@ -57,56 +64,64 @@ def setup_logging():
                 encoding="utf-8",
             ),
         ],
+        force=True,
     )
 
 
-def read_narration():
-    """Read generated Hindi narration."""
+# --------------------------------------------------
+# INPUT
+# --------------------------------------------------
 
+def read_narration():
     if not NARRATION_FILE.exists():
         raise FileNotFoundError(
             f"Narration text not found: {NARRATION_FILE}"
         )
 
     text = NARRATION_FILE.read_text(
-        encoding="utf-8"
+        encoding="utf-8-sig"
     ).strip()
 
     if not text:
         raise ValueError("Narration text is empty.")
 
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def get_audio_duration():
-    """Read actual WAV audio duration."""
-
     if not AUDIO_FILE.exists():
         raise FileNotFoundError(
             f"Narration audio not found: {AUDIO_FILE}"
         )
 
-    with wave.open(str(AUDIO_FILE), "rb") as audio:
+    try:
+        with wave.open(str(AUDIO_FILE), "rb") as audio:
+            frames = audio.getnframes()
+            sample_rate = audio.getframerate()
 
-        frames = audio.getnframes()
-        sample_rate = audio.getframerate()
+            if frames <= 0 or sample_rate <= 0:
+                raise ValueError("Invalid narration WAV file.")
 
-        if sample_rate <= 0 or frames <= 0:
-            raise ValueError("Invalid narration WAV file.")
+            duration = frames / sample_rate
 
-        duration = frames / sample_rate
+    except wave.Error as error:
+        raise ValueError(
+            f"Unable to read narration WAV: {error}"
+        ) from error
 
-    LOGGER.info(
-        "Audio duration: %.2f seconds",
-        duration
-    )
+    if duration <= 0:
+        raise ValueError("Invalid audio duration.")
+
+    LOGGER.info("Audio duration: %.2f seconds", duration)
 
     return duration
 
 
-def split_sentences(text):
-    """Split narration into meaningful sentences."""
+# --------------------------------------------------
+# TEXT PROCESSING
+# --------------------------------------------------
 
+def split_sentences(text):
     text = re.sub(r"\s+", " ", text).strip()
 
     sentences = re.split(
@@ -121,9 +136,7 @@ def split_sentences(text):
     ]
 
 
-def wrap_text(text, max_chars=MAX_CHARS_PER_LINE):
-    """Wrap Hindi text without breaking words."""
-
+def wrap_text(text):
     words = text.split()
 
     lines = []
@@ -131,22 +144,19 @@ def wrap_text(text, max_chars=MAX_CHARS_PER_LINE):
 
     for word in words:
 
-        if len(word) > max_chars:
-
-            if current_line:
-                lines.append(current_line)
-                current_line = ""
-
-            # Preserve long words instead of deleting characters.
-            lines.append(word)
-            continue
+        if len(word) > MAX_CHARS_PER_LINE:
+            raise ValueError(
+                "A single word exceeds the subtitle line limit: "
+                f"{word[:60]}"
+            )
 
         candidate = (
-            current_line + " " + word
-            if current_line else word
+            f"{current_line} {word}"
+            if current_line
+            else word
         )
 
-        if len(candidate) <= max_chars:
+        if len(candidate) <= MAX_CHARS_PER_LINE:
             current_line = candidate
 
         else:
@@ -162,29 +172,26 @@ def wrap_text(text, max_chars=MAX_CHARS_PER_LINE):
 
 
 def create_subtitle_segments(text):
-    """Create readable subtitle segments."""
-
     sentences = split_sentences(text)
+
+    if not sentences:
+        raise ValueError("No sentences found.")
 
     segments = []
 
     for sentence in sentences:
-
         lines = wrap_text(sentence)
 
-        current_lines = []
+        for index in range(
+            0,
+            len(lines),
+            MAX_LINES_PER_SUBTITLE
+        ):
+            selected_lines = lines[
+                index:index + MAX_LINES_PER_SUBTITLE
+            ]
 
-        for line in lines:
-
-            if len(current_lines) < MAX_LINES_PER_SUBTITLE:
-                current_lines.append(line)
-
-            else:
-                segments.append("\n".join(current_lines))
-                current_lines = [line]
-
-        if current_lines:
-            segments.append("\n".join(current_lines))
+            segments.append("\n".join(selected_lines))
 
     if not segments:
         raise ValueError("No subtitle segments generated.")
@@ -192,19 +199,29 @@ def create_subtitle_segments(text):
     return segments
 
 
-def calculate_weights(segments):
-    """Calculate approximate speaking-time weights."""
+# --------------------------------------------------
+# TIMING WEIGHTS
+# --------------------------------------------------
 
+def get_visible_character_count(segment):
+    return len(
+        segment.replace("\n", " ").strip()
+    )
+
+
+def calculate_weights(segments):
     weights = []
 
     for segment in segments:
+        count = get_visible_character_count(segment)
+
+        if count <= 0:
+            raise ValueError("Empty subtitle segment found.")
+
+        weight = float(count)
 
         visible_text = segment.replace("\n", " ").strip()
 
-        # Character-based approximation, not speech alignment.
-        weight = max(len(visible_text), 1)
-
-        # Slight pause allowance for sentence endings.
         if re.search(r"[।.!?]$", visible_text):
             weight *= 1.12
 
@@ -213,11 +230,30 @@ def calculate_weights(segments):
     return weights
 
 
+# --------------------------------------------------
+# AUDIO-BASED DURATION ALLOCATION
+# --------------------------------------------------
+
 def allocate_durations(segments, total_duration):
-    """Allocate estimated subtitle timing across audio."""
+    """
+    Allocate all subtitle timestamps proportionally
+    inside the actual narration duration.
+
+    The previous version raised an error when the sum
+    of minimum subtitle durations exceeded audio length.
+
+    This version scales all durations proportionally
+    to the available audio duration instead.
+
+    If the resulting reading speed is too fast, it is
+    reported as a warning rather than stopping generation.
+    """
 
     if not segments:
-        return []
+        raise ValueError("No subtitle segments available.")
+
+    if total_duration <= 0:
+        raise ValueError("Audio duration must be positive.")
 
     weights = calculate_weights(segments)
     total_weight = sum(weights)
@@ -225,60 +261,58 @@ def allocate_durations(segments, total_duration):
     if total_weight <= 0:
         raise ValueError("Invalid subtitle weights.")
 
-    count = len(segments)
-
-    # Keep all timestamps inside actual audio duration.
-    minimum = min(
-        MIN_SUBTITLE_DURATION,
-        total_duration / count
-    )
-
-    if minimum <= 0:
-        raise ValueError("Invalid audio duration.")
-
-    if count * minimum > total_duration:
-        minimum = total_duration / count
-
     durations = []
 
-    remaining = total_duration
-    remaining_weight = total_weight
-
-    for index, weight in enumerate(weights):
-
-        items_left = count - index
-
-        if items_left == 1:
-            duration = remaining
-
-        else:
-            proportional = (
-                remaining * weight / remaining_weight
-            )
-
-            minimum_remaining = (
-                minimum * (items_left - 1)
-            )
-
-            maximum_allowed = (
-                remaining - minimum_remaining
-            )
-
-            duration = max(
-                minimum,
-                min(proportional, maximum_allowed)
-            )
+    for weight in weights:
+        duration = (
+            total_duration * weight / total_weight
+        )
 
         durations.append(duration)
 
-        remaining -= duration
-        remaining_weight -= weight
+    # Correct floating-point accumulation so the total
+    # duration matches the WAV duration.
+    if durations:
+        durations[-1] += (
+            total_duration - sum(durations)
+        )
+
+    short_count = sum(
+        duration < MIN_SUBTITLE_DURATION
+        for duration in durations
+    )
+
+    long_count = sum(
+        duration > MAX_SUBTITLE_DURATION
+        for duration in durations
+    )
+
+    if short_count:
+        LOGGER.warning(
+            "%s subtitle(s) are shorter than %.1f seconds. "
+            "Audio duration has priority.",
+            short_count,
+            MIN_SUBTITLE_DURATION
+        )
+
+    if long_count:
+        LOGGER.warning(
+            "%s subtitle(s) exceed %.1f seconds. "
+            "Check subtitle segmentation.",
+            long_count,
+            MAX_SUBTITLE_DURATION
+        )
 
     return durations
 
 
+# --------------------------------------------------
+# TIMESTAMPS
+# --------------------------------------------------
+
 def format_timestamp(seconds):
-    """Convert seconds into SRT timestamp format."""
+    if seconds < 0:
+        raise ValueError("Negative timestamp.")
 
     milliseconds = round(seconds * 1000)
 
@@ -299,58 +333,145 @@ def format_timestamp(seconds):
     )
 
 
-def build_srt(segments, durations):
-    """Build complete SRT subtitle content."""
+# --------------------------------------------------
+# SRT BUILD
+# --------------------------------------------------
+
+def build_srt(segments, durations, audio_duration):
+    if len(segments) != len(durations):
+        raise ValueError(
+            "Subtitle segments and durations do not match."
+        )
 
     entries = []
-    current_time = 0.0
+    current_time_ms = 0
+    audio_limit_ms = round(audio_duration * 1000)
 
     for index, (segment, duration) in enumerate(
         zip(segments, durations),
         start=1
     ):
+        start_time_ms = current_time_ms
+        duration_ms = round(duration * 1000)
 
-        start_time = current_time
-        end_time = current_time + duration
+        if duration_ms <= 0:
+            raise ValueError(
+                f"Subtitle {index} has zero duration."
+            )
+
+        end_time_ms = start_time_ms + duration_ms
+
+        # Protect against rounding overflow.
+        if end_time_ms > audio_limit_ms:
+            end_time_ms = audio_limit_ms
+
+        if end_time_ms <= start_time_ms:
+            raise ValueError(
+                f"Invalid timestamp for subtitle {index}."
+            )
 
         entry = (
             f"{index}\n"
-            f"{format_timestamp(start_time)} --> "
-            f"{format_timestamp(end_time)}\n"
+            f"{format_timestamp(start_time_ms / 1000)} --> "
+            f"{format_timestamp(end_time_ms / 1000)}\n"
             f"{segment}\n"
         )
 
         entries.append(entry)
 
-        current_time = end_time
+        current_time_ms = end_time_ms
 
-    return "\n".join(entries), current_time
+    return "\n".join(entries), current_time_ms / 1000
 
+
+# --------------------------------------------------
+# VALIDATION
+# --------------------------------------------------
+
+def validate_subtitles(
+    segments,
+    durations,
+    audio_duration,
+    final_time
+):
+    if not segments:
+        raise ValueError("No subtitles generated.")
+
+    if len(segments) != len(durations):
+        raise ValueError("Subtitle count mismatch.")
+
+    previous_end_ms = 0
+    audio_limit_ms = round(audio_duration * 1000)
+
+    for index, (segment, duration) in enumerate(
+        zip(segments, durations),
+        start=1
+    ):
+        lines = segment.split("\n")
+
+        if len(lines) > MAX_LINES_PER_SUBTITLE:
+            raise ValueError(
+                f"Subtitle {index} has too many lines."
+            )
+
+        for line in lines:
+            if len(line) > MAX_CHARS_PER_LINE:
+                raise ValueError(
+                    f"Subtitle {index} exceeds line length."
+                )
+
+        duration_ms = round(duration * 1000)
+
+        start_ms = previous_end_ms
+        end_ms = start_ms + duration_ms
+
+        if duration_ms <= 0:
+            raise ValueError(
+                f"Subtitle {index} has invalid duration."
+            )
+
+        if end_ms > audio_limit_ms:
+            raise ValueError(
+                f"Subtitle {index} exceeds audio duration."
+            )
+
+        previous_end_ms = end_ms
+
+    if final_time > audio_duration + 0.001:
+        raise ValueError(
+            "Final subtitle exceeds narration duration."
+        )
+
+    return True
+
+
+# --------------------------------------------------
+# SAVE FILES
+# --------------------------------------------------
 
 def save_subtitles(srt_content):
-    """Save final SRT subtitle file."""
+    SUBTITLE_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    SUBTITLE_DIR.mkdir(parents=True, exist_ok=True)
-
-    with open(
-        SRT_FILE,
-        "w",
+    SRT_FILE.write_text(
+        srt_content,
         encoding="utf-8-sig"
-    ) as file:
-        file.write(srt_content)
+    )
+
+    if not SRT_FILE.exists() or SRT_FILE.stat().st_size == 0:
+        raise RuntimeError("SRT file was not saved.")
 
     LOGGER.info("SRT saved: %s", SRT_FILE)
 
 
 def save_report(report):
-    """Save subtitle generation report."""
-
     with open(
         REPORT_FILE,
         "w",
         encoding="utf-8"
     ) as file:
-
         json.dump(
             report,
             file,
@@ -361,9 +482,11 @@ def save_report(report):
     LOGGER.info("Report saved: %s", REPORT_FILE)
 
 
-def main():
-    """Execute subtitle generation."""
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
 
+def main():
     setup_logging()
 
     LOGGER.info("Starting Hindi subtitle generation.")
@@ -378,9 +501,7 @@ def main():
     narration = read_narration()
     audio_duration = get_audio_duration()
 
-    segments = create_subtitle_segments(
-        narration
-    )
+    segments = create_subtitle_segments(narration)
 
     durations = allocate_durations(
         segments,
@@ -389,27 +510,82 @@ def main():
 
     srt_content, final_time = build_srt(
         segments,
-        durations
+        durations,
+        audio_duration
+    )
+
+    validate_subtitles(
+        segments,
+        durations,
+        audio_duration,
+        final_time
     )
 
     save_subtitles(srt_content)
+
+    character_counts = [
+        get_visible_character_count(segment)
+        for segment in segments
+    ]
+
+    actual_speeds = [
+        count / duration
+        for count, duration in zip(
+            character_counts,
+            durations
+        )
+    ]
+
+    short_count = sum(
+        duration < MIN_SUBTITLE_DURATION
+        for duration in durations
+    )
+
+    long_count = sum(
+        duration > MAX_SUBTITLE_DURATION
+        for duration in durations
+    )
+
+    fast_count = sum(
+        speed > TARGET_CHARACTERS_PER_SECOND
+        for speed in actual_speeds
+    )
 
     report = {
         "status": "success",
         "language": "Hindi",
         "audio_file": str(AUDIO_FILE),
         "subtitle_file": str(SRT_FILE),
-        "audio_duration_seconds": round(
-            audio_duration, 3
-        ),
-        "subtitle_end_seconds": round(
-            final_time, 3
+        "audio_duration_seconds": round(audio_duration, 3),
+        "subtitle_end_seconds": round(final_time, 3),
+        "unsubtitled_audio_seconds": round(
+            max(0.0, audio_duration - final_time),
+            3
         ),
         "total_subtitles": len(segments),
         "max_chars_per_line": MAX_CHARS_PER_LINE,
         "max_lines_per_subtitle": MAX_LINES_PER_SUBTITLE,
-        "timing_method": "estimated_character_weighted",
+        "minimum_target_duration": MIN_SUBTITLE_DURATION,
+        "maximum_target_duration": MAX_SUBTITLE_DURATION,
+        "target_characters_per_second": TARGET_CHARACTERS_PER_SECOND,
+        "maximum_actual_characters_per_second": round(
+            max(actual_speeds),
+            2
+        ),
+        "subtitles_below_minimum_duration": short_count,
+        "subtitles_above_maximum_duration": long_count,
+        "subtitles_above_target_reading_speed": fast_count,
+        "timing_method": "audio_duration_proportional_character_weighted",
         "word_level_alignment": False,
+        "exact_speech_synchronization": False,
+        "reading_speed_target_checked": True,
+        "audio_duration_fit": True,
+        "status_note": (
+            "Estimated timing. Durations are proportionally "
+            "allocated within the audio. Short durations or "
+            "high reading speed are reported, not treated as "
+            "fatal errors."
+        ),
     }
 
     save_report(report)
@@ -418,19 +594,19 @@ def main():
     LOGGER.info("SUBTITLE GENERATION COMPLETED")
     LOGGER.info("Total subtitles: %s", len(segments))
     LOGGER.info("Audio duration: %.2f seconds", audio_duration)
-    LOGGER.info("Subtitle file: %s", SRT_FILE)
+    LOGGER.info("Subtitle end: %.2f seconds", final_time)
+    LOGGER.info("Short subtitles: %s", short_count)
+    LOGGER.info("Fast reading subtitles: %s", fast_count)
+    LOGGER.info("SRT file: %s", SRT_FILE)
     LOGGER.info("-----------------------------------")
 
 
 if __name__ == "__main__":
-
     try:
         main()
 
     except Exception:
-
         logging.exception(
             "Subtitle generation failed."
         )
-
         raise
