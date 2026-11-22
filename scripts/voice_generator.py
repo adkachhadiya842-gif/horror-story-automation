@@ -1,13 +1,19 @@
 
 """
 Hindi Horror Story Automation
-Optimized and Reliable Gemini TTS Generator
+Reliable Gemini TTS Generator
 
-The original input/story.txt is the ONLY narration source.
-Scene summaries are never used for voiceover.
+Features:
+- Original input/story.txt is the ONLY narration source.
+- Automatic retry for temporary API errors.
+- Exponential backoff for 429 and server errors.
+- Resume successful audio chunks on the next run.
+- Preserve validated audio chunks.
+- Validate WAV files before combining.
 """
 
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -51,13 +57,13 @@ DEFAULT_STYLE = (
 MIN_NARRATION_CHARACTERS = 300
 MIN_EXPECTED_AUDIO_SECONDS_PER_CHARACTER = 1 / 35
 
-# Optimized defaults
 DEFAULT_CHUNK_SIZE = 2500
 MAX_CHUNK_SIZE = 4000
 
-# Retry limits
 MAX_BACKOFF_SECONDS = 180
 RATE_LIMIT_BASE_WAIT = 30
+
+MANIFEST_FILE = CHUNKS_DIR / "chunk_manifest.json"
 
 
 def setup_logging():
@@ -404,7 +410,7 @@ def get_error_status(error):
 
 
 def is_permanent_quota_error(error):
-    """Detect quota exhaustion that retries cannot fix."""
+    """Detect clearly permanent daily quota or billing errors."""
 
     message = str(error).lower()
 
@@ -413,10 +419,11 @@ def is_permanent_quota_error(error):
         "per-day",
         "daily limit",
         "daily quota",
-        "quota exceeded for quota metric",
-        "limit: 0",
-        "billing",
+        "daily request limit",
+        "billing account",
+        "billing is disabled",
         "insufficient quota",
+        "limit: 0",
     )
 
     return any(
@@ -426,7 +433,7 @@ def is_permanent_quota_error(error):
 
 
 def is_retryable_error(error):
-    """Only retry temporary service and rate-limit errors."""
+    """Retry temporary service and rate-limit errors."""
 
     status = get_error_status(error)
 
@@ -444,6 +451,7 @@ def is_retryable_error(error):
         "service unavailable",
         "resource exhausted",
         "too many requests",
+        "rate limit",
     )
 
     return any(
@@ -509,6 +517,125 @@ def calculate_retry_wait(error, attempt, settings):
     return wait_seconds
 
 
+def get_chunk_hash(text):
+    """Create a unique hash for a narration chunk."""
+
+    return hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()
+
+
+def load_manifest():
+    """Load existing chunk metadata for resume support."""
+
+    if not MANIFEST_FILE.exists():
+        return {}
+
+    try:
+        data = json.loads(
+            MANIFEST_FILE.read_text(encoding="utf-8")
+        )
+
+        if isinstance(data, dict):
+            return data
+
+    except Exception as error:
+        LOGGER.warning(
+            "Could not load chunk manifest: %s",
+            error,
+        )
+
+    return {}
+
+
+def save_manifest(manifest):
+    """Save successful chunk metadata."""
+
+    CHUNKS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_manifest = MANIFEST_FILE.with_suffix(
+        ".temporary.json"
+    )
+
+    temporary_manifest.write_text(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            indent=4,
+        ),
+        encoding="utf-8",
+    )
+
+    temporary_manifest.replace(MANIFEST_FILE)
+
+
+def get_valid_existing_chunk(
+    output_path,
+    chunk_text,
+    chunk_number,
+    manifest,
+):
+    """Reuse an existing chunk only when its text hash matches."""
+
+    if not output_path.exists():
+        return None
+
+    saved_metadata = manifest.get(
+        output_path.name
+    )
+
+    expected_hash = get_chunk_hash(chunk_text)
+
+    if not isinstance(saved_metadata, dict):
+        LOGGER.info(
+            "Existing chunk %s has no verified metadata. "
+            "It will be regenerated.",
+            chunk_number,
+        )
+        return None
+
+    if saved_metadata.get("text_sha256") != expected_hash:
+        LOGGER.info(
+            "Existing chunk %s belongs to different narration. "
+            "It will be regenerated.",
+            chunk_number,
+        )
+        return None
+
+    try:
+        duration = validate_wav(
+            output_path,
+            len(chunk_text),
+        )
+
+        LOGGER.info(
+            "RESUME: Chunk %s already exists and is valid. "
+            "Skipping API generation.",
+            chunk_number,
+        )
+
+        return {
+            "chunk_number": chunk_number,
+            "characters": len(chunk_text),
+            "duration_seconds": duration,
+            "path": str(output_path),
+            "status": "success",
+            "resumed": True,
+        }
+
+    except Exception as error:
+        LOGGER.warning(
+            "Existing chunk %s failed validation: %s",
+            chunk_number,
+            error,
+        )
+
+        return None
+
+
 def generate_audio_chunk(
     client,
     text,
@@ -520,14 +647,19 @@ def generate_audio_chunk(
 
     last_error = None
 
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_path = output_path.with_name(
+        output_path.stem + ".temporary.wav"
+    )
+
     for attempt in range(
         1,
         settings["max_retries"] + 1,
     ):
-
-        temporary_path = output_path.with_name(
-            output_path.stem + ".temporary.wav"
-        )
 
         try:
             LOGGER.info(
@@ -594,11 +726,6 @@ def generate_audio_chunk(
                     "Gemini output is not a valid WAV file."
                 )
 
-            output_path.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
             temporary_path.write_bytes(audio_bytes)
 
             duration = validate_wav(
@@ -621,6 +748,7 @@ def generate_audio_chunk(
                 "duration_seconds": duration,
                 "path": str(output_path),
                 "status": "success",
+                "resumed": False,
             }
 
         except Exception as error:
@@ -637,13 +765,10 @@ def generate_audio_chunk(
             if temporary_path.exists():
                 temporary_path.unlink()
 
-            if output_path.exists():
-                output_path.unlink()
-
             if is_permanent_quota_error(error):
                 raise RuntimeError(
-                    "Gemini quota appears exhausted. "
-                    "Automatic retries will not fix a daily quota limit. "
+                    "Gemini quota or billing limit appears exhausted. "
+                    "Automatic retries may not fix this issue. "
                     f"Original error: {error}"
                 ) from error
 
@@ -791,7 +916,7 @@ def main():
     )
 
     LOGGER.info(
-        "Configured chunk size: %s characters",
+        "Configured chunk size: %s",
         settings["chunk_size"],
     )
 
@@ -800,20 +925,14 @@ def main():
         exist_ok=True,
     )
 
-    for old_file in CHUNKS_DIR.glob("narration_*.wav"):
-        old_file.unlink()
+    manifest = load_manifest()
 
-    for old_file in [
-        FINAL_AUDIO,
-        REPORT_FILE,
-    ]:
-        if old_file.exists():
-            old_file.unlink()
-
-    client = create_client()
-
+    # Keep existing successful chunks.
+    # Old or mismatched chunks are replaced only when necessary.
     generated_chunks = []
     chunk_paths = []
+
+    client = None
 
     for index, chunk in enumerate(chunks, start=1):
 
@@ -822,13 +941,41 @@ def main():
             / f"narration_{index:03d}.wav"
         )
 
-        result = generate_audio_chunk(
-            client=client,
-            text=chunk,
+        chunk_hash = get_chunk_hash(chunk)
+
+        result = get_valid_existing_chunk(
             output_path=output_path,
-            settings=settings,
+            chunk_text=chunk,
             chunk_number=index,
+            manifest=manifest,
         )
+
+        if result is None:
+
+            # Remove only the invalid chunk being regenerated.
+            if output_path.exists():
+                output_path.unlink()
+
+            if client is None:
+                client = create_client()
+
+            result = generate_audio_chunk(
+                client=client,
+                text=chunk,
+                output_path=output_path,
+                settings=settings,
+                chunk_number=index,
+            )
+
+            manifest[output_path.name] = {
+                "text_sha256": chunk_hash,
+                "characters": len(chunk),
+                "model": settings["model"],
+                "voice": settings["voice"],
+                "status": "success",
+            }
+
+            save_manifest(manifest)
 
         generated_chunks.append(result)
         chunk_paths.append(output_path)
@@ -857,6 +1004,12 @@ def main():
             raise RuntimeError(
                 f"Chunk {index} audio file is missing."
             )
+
+        # Validate every chunk again before combining.
+        validate_wav(
+            result["path"],
+            len(source_chunk),
+        )
 
     reconstructed_narration = " ".join(chunks)
 
