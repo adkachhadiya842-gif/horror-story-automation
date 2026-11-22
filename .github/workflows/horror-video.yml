@@ -22,7 +22,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install system dependencies
+      - name: Install FFmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
@@ -34,26 +34,24 @@ jobs:
 
       - name: Create output folders
         run: |
-          mkdir -p output
           mkdir -p output/images
           mkdir -p output/audio
           mkdir -p output/subtitles
           mkdir -p output/thumbnail
 
-            - name: Run horror production pipeline
+      - name: Run horror production pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python scripts/pipeline.py
+          python -m scripts.pipeline
 
-      - name: Upload generated video and assets
+      - name: Upload generated files
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: horror-video-production
-          path: |
-            output/
+          path: output/
           if-no-files-found: warn
           retention-days: 7
