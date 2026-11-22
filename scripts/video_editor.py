@@ -3,16 +3,16 @@
 Cinematic Horror Story - Video Editor
 
 Features:
-- Uses only successful current-run images.
+- Uses successful current-run images only.
 - Preserves chronological scene order.
-- Reads resolution, FPS and camera settings from config.json.
-- Matches rendered video duration to selected narration audio.
-- Cinematic crossfade transitions using FFmpeg xfade.
-- Alternating zoom-in, zoom-out and directional pan.
-- Burns Hindi subtitles when enabled.
-- Validates SRT timing against selected audio.
-- Verifies final video/audio streams using FFprobe.
-- Saves a detailed production report.
+- Reads video settings from config.json.
+- Matches video duration to selected narration audio.
+- FFmpeg cinematic crossfade transitions.
+- Alternating zoom and directional pan.
+- Hindi subtitle rendering.
+- Validates subtitles against selected audio.
+- Verifies final video/audio streams.
+- Saves a detailed video report.
 """
 
 import json
@@ -58,7 +58,10 @@ DEFAULT_TRANSITION_DURATION = 0.8
 DURATION_TOLERANCE = 0.20
 
 SUPPORTED_IMAGE_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".webp"
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
 }
 
 
@@ -67,8 +70,6 @@ SUPPORTED_IMAGE_EXTENSIONS = {
 # --------------------------------------------------
 
 def run_command(command, cwd=None):
-    """Run an external command and return its result."""
-
     result = subprocess.run(
         command,
         stdout=subprocess.PIPE,
@@ -115,7 +116,11 @@ def load_json(path):
             f"Required file not found: {path}"
         )
 
-    with open(path, "r", encoding="utf-8-sig") as file:
+    with open(
+        path,
+        "r",
+        encoding="utf-8-sig",
+    ) as file:
         data = json.load(file)
 
     if not isinstance(data, dict):
@@ -180,34 +185,43 @@ def load_video_settings():
         )
     )
 
-    if not math.isfinite(transition_duration):
-        raise ValueError("Invalid transition duration.")
-
-    if transition_duration < 0:
+    if (
+        not math.isfinite(transition_duration)
+        or transition_duration < 0
+    ):
         raise ValueError(
-            "Transition duration cannot be negative."
+            "Invalid transition duration."
         )
 
     zoom_effect = video.get("zoom_effect", True)
     pan_effect = video.get("pan_effect", True)
 
     if not isinstance(zoom_effect, bool):
-        raise ValueError("zoom_effect must be true or false.")
+        raise ValueError(
+            "zoom_effect must be true or false."
+        )
 
     if not isinstance(pan_effect, bool):
-        raise ValueError("pan_effect must be true or false.")
+        raise ValueError(
+            "pan_effect must be true or false."
+        )
 
     subtitles = config.get("subtitles", {})
 
     if not isinstance(subtitles, dict):
-        raise ValueError("Invalid subtitles configuration.")
+        raise ValueError(
+            "Invalid subtitles configuration."
+        )
 
     enabled = subtitles.get("enabled", False)
     burn = subtitles.get("burn_into_video", False)
 
-    if not isinstance(enabled, bool) or not isinstance(burn, bool):
+    if (
+        not isinstance(enabled, bool)
+        or not isinstance(burn, bool)
+    ):
         raise ValueError(
-            "Subtitle enabled and burn_into_video must be booleans."
+            "Subtitle settings must be booleans."
         )
 
     return {
@@ -226,11 +240,6 @@ def load_video_settings():
 # --------------------------------------------------
 
 def find_audio():
-    """
-    Prefer final mixed audio.
-    Fall back to narration audio.
-    """
-
     candidates = [
         AUDIO_DIR / "final_audio.wav",
         AUDIO_DIR / "narration.wav",
@@ -261,6 +270,7 @@ def get_audio_info(audio_path):
     data = json.loads(result.stdout)
 
     streams = data.get("streams", [])
+
     audio_stream = next(
         (
             stream for stream in streams
@@ -274,17 +284,14 @@ def get_audio_info(audio_path):
             "Selected audio file has no audio stream."
         )
 
-    duration = float(
-        audio_stream.get(
-            "duration",
-            data.get("format", {}).get("duration", 0),
-        )
-    )
+    raw_duration = audio_stream.get("duration")
 
-    if not math.isfinite(duration) or duration <= 0:
-        duration = float(
-            data.get("format", {}).get("duration", 0)
-        )
+    if raw_duration in (None, "N/A"):
+        raw_duration = data.get(
+            "format", {}
+        ).get("duration", 0)
+
+    duration = float(raw_duration)
 
     if not math.isfinite(duration) or duration <= 0:
         raise RuntimeError(
@@ -304,7 +311,8 @@ def get_audio_info(audio_path):
 
 def get_current_run_images():
     """
-    Use successful images from the latest image report only.
+    Read only successful scene images from the current
+    image_generation_report.json.
     """
 
     report = load_json(IMAGE_REPORT_FILE)
@@ -349,21 +357,30 @@ def get_current_run_images():
         image_path = image_path.resolve()
 
         try:
-            image_path.relative_to(IMAGE_DIR.resolve())
-        except ValueError:
-            raise ValueError(
-                "Image outside output/images/: "
-                f"{image_path}"
+            image_path.relative_to(
+                IMAGE_DIR.resolve()
             )
+        except ValueError as error:
+            raise ValueError(
+                f"Image outside output/images/: {image_path}"
+            ) from error
 
         if not image_path.is_file():
             raise FileNotFoundError(
                 f"Image is missing: {image_path}"
             )
 
-        if image_path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+        if (
+            image_path.suffix.lower()
+            not in SUPPORTED_IMAGE_EXTENSIONS
+        ):
             raise ValueError(
                 f"Unsupported image format: {image_path}"
+            )
+
+        if image_path.stat().st_size == 0:
+            raise ValueError(
+                f"Image is empty: {image_path}"
             )
 
         images.append({
@@ -428,23 +445,20 @@ def get_scene_weights(images, analysis):
 # --------------------------------------------------
 
 def allocate_frames(weights, total_frames):
-    """
-    Allocate exact integer frame counts.
-    """
-
     if not weights:
-        raise ValueError("No scene weights available.")
+        raise ValueError(
+            "No scene weights available."
+        )
 
     if total_frames < len(weights):
         raise ValueError(
             "Narration is too short for the number of scene images."
         )
 
-    if any(weight <= 0 for weight in weights):
-        weights = [
-            max(int(weight), 1)
-            for weight in weights
-        ]
+    weights = [
+        max(int(weight), 1)
+        for weight in weights
+    ]
 
     total_weight = sum(weights)
 
@@ -462,7 +476,9 @@ def allocate_frames(weights, total_frames):
 
     order = sorted(
         range(len(weights)),
-        key=lambda index: exact[index] - allocations[index],
+        key=lambda index: (
+            exact[index] - allocations[index]
+        ),
         reverse=True,
     )
 
@@ -470,10 +486,14 @@ def allocate_frames(weights, total_frames):
         allocations[index] += 1
 
     if sum(allocations) != total_frames:
-        raise RuntimeError("Frame allocation mismatch.")
+        raise RuntimeError(
+            "Frame allocation mismatch."
+        )
 
-    if any(frame_count <= 0 for frame_count in allocations):
-        raise RuntimeError("A scene received zero frames.")
+    if any(value <= 0 for value in allocations):
+        raise RuntimeError(
+            "A scene received zero frames."
+        )
 
     return allocations
 
@@ -487,12 +507,6 @@ def calculate_transition_frames(
     requested_duration,
     fps,
 ):
-    """
-    Calculate a safe transition length.
-
-    Transition must be shorter than the shortest scene.
-    """
-
     if len(base_allocations) < 2:
         return 0
 
@@ -517,8 +531,8 @@ def calculate_transition_frames(
 
     if actual_frames != requested_frames:
         print(
-            "WARNING: Transition duration reduced to fit "
-            "the shortest scene."
+            "WARNING: Transition duration reduced "
+            "to fit the shortest scene."
         )
 
     return actual_frames
@@ -538,11 +552,33 @@ def create_camera_filter(
     pan_enabled,
 ):
     """
-    Create zoom and directional pan effects.
+    Zoom and pan behavior:
 
-    Movement direction alternates between scenes.
+    Both disabled:
+        Fit and crop to the target frame without extra zoom.
+
+    Zoom only:
+        Centered alternating zoom.
+
+    Pan only:
+        Constant slight zoom provides room for pan movement.
+
+    Both enabled:
+        Alternating zoom with directional pan.
     """
 
+    if not zoom_enabled and not pan_enabled:
+        return ",".join([
+            (
+                f"scale={width}:{height}:"
+                "force_original_aspect_ratio=increase"
+            ),
+            f"crop={width}:{height}",
+            "setsar=1",
+            "format=yuv420p",
+        ])
+
+    # Extra image area is needed for camera movement.
     scale_width = round(width * 1.18)
     scale_height = round(height * 1.18)
 
@@ -553,14 +589,6 @@ def create_camera_filter(
         ),
         f"crop={scale_width}:{scale_height}",
     ]
-
-    if not zoom_enabled and not pan_enabled:
-        filters.extend([
-            f"scale={width}:{height}",
-            "setsar=1",
-            "format=yuv420p",
-        ])
-        return ",".join(filters)
 
     if zoom_enabled:
         if index % 2 == 0:
@@ -573,6 +601,9 @@ def create_camera_filter(
                 "if(eq(on,0),1.10,"
                 "max(zoom-0.0007,1.0))"
             )
+    elif pan_enabled:
+        # A fixed zoom is required to create a movable crop area.
+        zoom_expression = "1.08"
     else:
         zoom_expression = "1.0"
 
@@ -583,28 +614,41 @@ def create_camera_filter(
             x_expression = (
                 "(iw-iw/zoom)*on/max(d-1,1)"
             )
-            y_expression = "ih/2-ih/zoom/2"
+            y_expression = (
+                "ih/2-ih/zoom/2"
+            )
 
         elif direction == 1:
             x_expression = (
                 "(iw-iw/zoom)*(1-on/max(d-1,1))"
             )
-            y_expression = "ih/2-ih/zoom/2"
+            y_expression = (
+                "ih/2-ih/zoom/2"
+            )
 
         elif direction == 2:
-            x_expression = "iw/2-iw/zoom/2"
+            x_expression = (
+                "iw/2-iw/zoom/2"
+            )
             y_expression = (
                 "(ih-ih/zoom)*on/max(d-1,1)"
             )
 
         else:
-            x_expression = "iw/2-iw/zoom/2"
+            x_expression = (
+                "iw/2-iw/zoom/2"
+            )
             y_expression = (
                 "(ih-ih/zoom)*(1-on/max(d-1,1))"
             )
+
     else:
-        x_expression = "iw/2-iw/zoom/2"
-        y_expression = "ih/2-ih/zoom/2"
+        x_expression = (
+            "iw/2-iw/zoom/2"
+        )
+        y_expression = (
+            "ih/2-ih/zoom/2"
+        )
 
     filters.append(
         f"zoompan=z='{zoom_expression}':"
@@ -661,7 +705,10 @@ def create_scene_clip(
         str(output_path),
     ])
 
-    if not output_path.is_file() or output_path.stat().st_size == 0:
+    if (
+        not output_path.is_file()
+        or output_path.stat().st_size == 0
+    ):
         raise RuntimeError(
             f"Scene clip failed: {output_path}"
         )
@@ -679,14 +726,22 @@ def create_transition_video(
     output_path,
 ):
     """
-    Join scene clips with FFmpeg xfade transitions.
+    Join clips with xfade.
 
-    The total final timeline remains equal to the sum
-    of base scene frame allocations.
+    Scene clips before the final scene contain extra outgoing
+    transition frames. Therefore cumulative base-frame offsets
+    preserve the exact intended total timeline.
     """
 
     if not clip_paths:
-        raise ValueError("No scene clips supplied.")
+        raise ValueError(
+            "No scene clips supplied."
+        )
+
+    if len(clip_paths) != len(base_allocations):
+        raise ValueError(
+            "Clip count and frame allocation count do not match."
+        )
 
     if len(clip_paths) == 1 or transition_frames <= 0:
         concat_file = TEMP_DIR / "concat_list.txt"
@@ -771,11 +826,9 @@ def create_transition_video(
         f"[finalv]"
     )
 
-    filter_complex = ";".join(filters)
-
     command.extend([
         "-filter_complex",
-        filter_complex,
+        ";".join(filters),
         "-map",
         "[finalv]",
         "-an",
@@ -790,7 +843,10 @@ def create_transition_video(
 
     run_command(command)
 
-    if not output_path.is_file() or output_path.stat().st_size == 0:
+    if (
+        not output_path.is_file()
+        or output_path.stat().st_size == 0
+    ):
         raise RuntimeError(
             "Transition video was not created."
         )
@@ -844,9 +900,14 @@ def validate_srt(audio_duration):
     ).strip()
 
     if not content:
-        raise ValueError("Subtitle file is empty.")
+        raise ValueError(
+            "Subtitle file is empty."
+        )
 
-    blocks = re.split(r"\n\s*\n", content)
+    blocks = re.split(
+        r"\n\s*\n",
+        content,
+    )
 
     previous_end = 0.0
     subtitle_count = 0
@@ -855,24 +916,34 @@ def validate_srt(audio_duration):
         lines = block.splitlines()
 
         if len(lines) < 3:
-            raise ValueError("Malformed SRT subtitle block.")
+            raise ValueError(
+                "Malformed SRT subtitle block."
+            )
 
         if not lines[0].strip().isdigit():
-            raise ValueError("Invalid SRT subtitle index.")
+            raise ValueError(
+                "Invalid SRT subtitle index."
+            )
 
         times = lines[1].split("-->")
 
         if len(times) != 2:
-            raise ValueError("Invalid SRT time range.")
+            raise ValueError(
+                "Invalid SRT time range."
+            )
 
         start = parse_srt_time(times[0])
         end = parse_srt_time(times[1])
 
         if end <= start:
-            raise ValueError("Subtitle has invalid duration.")
+            raise ValueError(
+                "Subtitle has invalid duration."
+            )
 
         if start < previous_end - 0.001:
-            raise ValueError("SRT subtitles overlap or are out of order.")
+            raise ValueError(
+                "SRT subtitles overlap or are out of order."
+            )
 
         if end > audio_duration + 0.25:
             raise ValueError(
@@ -881,14 +952,21 @@ def validate_srt(audio_duration):
 
         subtitle_text = lines[2:]
 
-        if not any(line.strip() for line in subtitle_text):
-            raise ValueError("Empty subtitle text.")
+        if not any(
+            line.strip()
+            for line in subtitle_text
+        ):
+            raise ValueError(
+                "Empty subtitle text."
+            )
 
         previous_end = end
         subtitle_count += 1
 
     if subtitle_count == 0:
-        raise ValueError("No valid SRT entries found.")
+        raise ValueError(
+            "No valid SRT entries found."
+        )
 
     return {
         "subtitle_count": subtitle_count,
@@ -906,10 +984,6 @@ def validate_srt(audio_duration):
 # --------------------------------------------------
 
 def check_subtitle_support():
-    """
-    Check FFmpeg subtitles filter and Hindi font availability.
-    """
-
     filters_result = run_command([
         "ffmpeg",
         "-hide_banner",
@@ -925,26 +999,22 @@ def check_subtitle_support():
             "Install FFmpeg with libass support."
         )
 
-    try:
-        font_result = run_command([
-            "fc-match",
-            "-f",
-            "%{file}",
-            "Noto Sans Devanagari",
-        ])
+    font_result = run_command([
+        "fc-match",
+        "-f",
+        "%{file}",
+        "Noto Sans Devanagari",
+    ])
 
-        font_path = font_result.stdout.strip()
+    font_path = font_result.stdout.strip()
 
-        if not font_path or not Path(font_path).is_file():
-            raise RuntimeError(
-                "Noto Sans Devanagari font was not found."
-            )
-
-    except Exception as error:
+    if (
+        not font_path
+        or not Path(font_path).is_file()
+    ):
         raise RuntimeError(
-            "Hindi font check failed. "
-            "Install fonts-noto-core and fontconfig."
-        ) from error
+            "Noto Sans Devanagari font was not found."
+        )
 
     return font_path
 
@@ -961,8 +1031,10 @@ def escape_subtitle_path(path):
 
 
 def burn_subtitles(input_video, output_video, settings):
+    audio_info = get_audio_info(find_audio())
+
     srt_info = validate_srt(
-        get_audio_info(find_audio())["duration"]
+        audio_info["duration"]
     )
 
     font_path = check_subtitle_support()
@@ -1001,7 +1073,10 @@ def burn_subtitles(input_video, output_video, settings):
         str(output_video),
     ])
 
-    if not output_video.is_file() or output_video.stat().st_size == 0:
+    if (
+        not output_video.is_file()
+        or output_video.stat().st_size == 0
+    ):
         raise RuntimeError(
             "Hindi subtitle rendering failed."
         )
@@ -1064,13 +1139,18 @@ def get_video_info(video_path):
         data.get("format", {}).get("duration", 0)
     )
 
-    video_duration = float(
-        video_stream.get("duration", duration)
-    )
+    def stream_duration(stream):
+        value = stream.get("duration")
 
-    audio_duration = float(
-        audio_stream.get("duration", duration)
-    )
+        if value in (None, "N/A"):
+            return duration
+
+        return float(value)
+
+    video_duration = stream_duration(video_stream)
+    audio_duration = stream_duration(audio_stream)
+
+    fps_value = video_stream.get("r_frame_rate")
 
     return {
         "duration": duration,
@@ -1078,7 +1158,7 @@ def get_video_info(video_path):
         "audio_duration": audio_duration,
         "width": int(video_stream.get("width", 0)),
         "height": int(video_stream.get("height", 0)),
-        "fps": video_stream.get("r_frame_rate"),
+        "fps": fps_value,
         "has_video": True,
         "has_audio": True,
     }
@@ -1105,7 +1185,6 @@ def create_video():
     audio_info = get_audio_info(audio_path)
 
     audio_duration = audio_info["duration"]
-
     fps = settings["fps"]
 
     total_frames = round(
@@ -1135,8 +1214,7 @@ def create_video():
         fps,
     )
 
-    # Each clip except the last must include extra frames
-    # to support its outgoing crossfade.
+    # Add outgoing transition frames to every clip except the last.
     clip_allocations = list(base_allocations)
 
     if transition_frames > 0:
@@ -1222,7 +1300,9 @@ def create_video():
 
         video_for_audio = captioned_video
 
-    print("Combining video and final narration audio...")
+    print(
+        "Combining video and final narration audio..."
+    )
 
     run_command([
         "ffmpeg",
@@ -1244,7 +1324,10 @@ def create_video():
         str(FINAL_VIDEO),
     ])
 
-    if not FINAL_VIDEO.is_file() or FINAL_VIDEO.stat().st_size == 0:
+    if (
+        not FINAL_VIDEO.is_file()
+        or FINAL_VIDEO.stat().st_size == 0
+    ):
         raise RuntimeError(
             "Final video was not created."
         )
@@ -1260,7 +1343,9 @@ def create_video():
             f"{video_info['width']}x{video_info['height']}"
         )
 
-    if video_info["fps"] != f"{fps}/1":
+    expected_fps = f"{fps}/1"
+
+    if video_info["fps"] != expected_fps:
         raise RuntimeError(
             f"Final FPS mismatch: {video_info['fps']}"
         )
@@ -1348,7 +1433,10 @@ def create_video():
         "status": "completed",
     }
 
-    save_json(VIDEO_REPORT, report)
+    save_json(
+        VIDEO_REPORT,
+        report,
+    )
 
     print("\n--------------------------------------")
     print("VIDEO CREATED AND VERIFIED")
@@ -1358,17 +1446,21 @@ def create_video():
         f"Duration: {video_info['duration']:.3f}s"
     )
     print(
-        f"Resolution: {video_info['width']}x{video_info['height']}"
+        f"Resolution: "
+        f"{video_info['width']}x{video_info['height']}"
     )
     print(f"FPS: {video_info['fps']}")
     print(
-        f"Audio/video difference: {duration_difference:.3f}s"
+        f"Audio/video difference: "
+        f"{duration_difference:.3f}s"
     )
     print(
-        f"Transitions: {transition_info['transition_count']}"
+        f"Transitions: "
+        f"{transition_info['transition_count']}"
     )
     print(
-        f"Hindi subtitles: {settings['subtitles_enabled']}"
+        f"Hindi subtitles: "
+        f"{settings['subtitles_enabled']}"
     )
     print("--------------------------------------")
 
