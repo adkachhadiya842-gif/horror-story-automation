@@ -7,14 +7,12 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 
+from scripts.utils import OUTPUT_DIR, logger
+from scripts.validators import run_all_validations
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
-INPUT_DIR = BASE_DIR / "input"
-OUTPUT_DIR = BASE_DIR / "output"
-
-STORY_FILE = INPUT_DIR / "story.txt"
-
 
 PIPELINE_STEPS = [
     ("Story Analysis", "story_analyzer.py"),
@@ -37,35 +35,13 @@ def save_report(report):
     report_path = OUTPUT_DIR / "pipeline_report.json"
 
     with open(report_path, "w", encoding="utf-8") as file:
-        json.dump(
-            report,
-            file,
-            indent=4,
-            ensure_ascii=False
-        )
+        json.dump(report, file, indent=4, ensure_ascii=False)
 
     return report_path
 
 
-def check_requirements():
-    if not STORY_FILE.exists():
-        raise FileNotFoundError(
-            "Story file missing: input/story.txt"
-        )
-
-    story = STORY_FILE.read_text(
-        encoding="utf-8"
-    ).strip()
-
-    if len(story) < 100:
-        raise ValueError(
-            "Story is too short. Please provide a complete story."
-        )
-
-    if not (BASE_DIR / "requirements.txt").exists():
-        raise FileNotFoundError(
-            "requirements.txt is missing."
-        )
+def check_pipeline_files():
+    """Check that all required production scripts exist."""
 
     for step_name, script_name in PIPELINE_STEPS:
         script_path = SCRIPTS_DIR / script_name
@@ -74,6 +50,13 @@ def check_requirements():
             raise FileNotFoundError(
                 f"Missing script for {step_name}: {script_path}"
             )
+
+    requirements_file = BASE_DIR / "requirements.txt"
+
+    if not requirements_file.is_file():
+        raise FileNotFoundError("requirements.txt is missing.")
+
+    logger.info("Pipeline file checks passed.")
 
 
 def run_step(step_name, script_name, report):
@@ -113,13 +96,11 @@ def run_step(step_name, script_name, report):
         step_report["status"] = "completed"
         step_report["finished_at"] = current_time()
         step_report["duration_seconds"] = round(
-            time.monotonic() - start,
-            2
+            time.monotonic() - start, 2
         )
 
         report["completed_steps"].append(step_name)
         report["current_step"] = None
-
         save_report(report)
 
         print(f"\nCOMPLETED: {step_name}")
@@ -129,13 +110,11 @@ def run_step(step_name, script_name, report):
         step_report["error"] = str(error)
         step_report["finished_at"] = current_time()
         step_report["duration_seconds"] = round(
-            time.monotonic() - start,
-            2
+            time.monotonic() - start, 2
         )
 
         report["failed_step"] = step_name
         report["current_step"] = None
-
         save_report(report)
 
         raise
@@ -148,6 +127,7 @@ def main():
         "project": "horror-story-automation",
         "started_at": current_time(),
         "status": "running",
+        "validation_status": "pending",
         "completed_steps": [],
         "failed_step": None,
         "current_step": None,
@@ -160,14 +140,21 @@ def main():
     save_report(report)
 
     try:
-        check_requirements()
+        # Step 1: Validate story, config and API credentials.
+        print("\nRunning project validations...")
 
+        run_all_validations()
+        check_pipeline_files()
+
+        report["validation_status"] = "passed"
+        report["validated_at"] = current_time()
+        save_report(report)
+
+        print("All validations passed.")
+
+        # Step 2: Run production scripts sequentially.
         for step_name, script_name in PIPELINE_STEPS:
-            run_step(
-                step_name,
-                script_name,
-                report
-            )
+            run_step(step_name, script_name, report)
 
         report["status"] = "completed"
         report["finished_at"] = current_time()
@@ -178,8 +165,7 @@ def main():
         )
 
         report["total_duration_seconds"] = round(
-            total_duration,
-            2
+            total_duration, 2
         )
 
         save_report(report)
@@ -187,19 +173,19 @@ def main():
         print("\n" + "=" * 60)
         print("ALL PIPELINE STEPS COMPLETED SUCCESSFULLY")
         print("=" * 60)
-
-        print(
-            "Check the output folder for your final video "
-            "and thumbnail."
-        )
+        print("Check the output folder for your final video and thumbnail.")
 
     except Exception as error:
         report["status"] = "failed"
         report["error"] = str(error)
         report["finished_at"] = current_time()
 
+        if report["validation_status"] == "pending":
+            report["validation_status"] = "failed"
+
         save_report(report)
 
+        logger.exception("Production pipeline failed.")
         print("\nPIPELINE FAILED")
         print(str(error))
 
