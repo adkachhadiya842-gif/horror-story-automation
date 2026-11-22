@@ -1,5 +1,6 @@
 
 import json
+import math
 import subprocess
 import sys
 import time
@@ -7,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from scripts.utils import OUTPUT_DIR, logger
 from scripts.validators import run_all_validations
@@ -19,9 +20,11 @@ SCRIPTS_DIR = BASE_DIR / "scripts"
 VIDEO_FILE = OUTPUT_DIR / "final_video.mp4"
 THUMBNAIL_FILE = OUTPUT_DIR / "thumbnail" / "youtube_thumbnail.jpg"
 
-# IMPORTANT:
-# Sound design must run before subtitle generation because
-# subtitles use final_audio.wav for accurate total duration.
+EXPECTED_VIDEO_WIDTH = 1920
+EXPECTED_VIDEO_HEIGHT = 1080
+
+EXPECTED_THUMBNAIL_WIDTH = 1280
+EXPECTED_THUMBNAIL_HEIGHT = 720
 
 PIPELINE_STEPS = [
     ("Story Analysis", "story_analyzer.py"),
@@ -68,14 +71,17 @@ def save_report(report):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     report_path = OUTPUT_DIR / "pipeline_report.json"
+    temporary_path = OUTPUT_DIR / "pipeline_report.json.tmp"
 
-    with open(report_path, "w", encoding="utf-8") as file:
+    with open(temporary_path, "w", encoding="utf-8") as file:
         json.dump(
             report,
             file,
             indent=4,
             ensure_ascii=False,
         )
+
+    temporary_path.replace(report_path)
 
     return report_path
 
@@ -103,7 +109,31 @@ def check_pipeline_files():
     logger.info("Pipeline file checks passed.")
 
 
-def verify_step_outputs(step_name):
+def remove_old_step_outputs(step_name):
+    """
+    Remove only the expected output files for the current step.
+
+    This prevents an old output from a previous run from being
+    mistaken for a newly generated successful output.
+    """
+
+    expected_files = STEP_OUTPUTS.get(step_name, [])
+
+    for file_path in expected_files:
+        if file_path.exists():
+            if file_path.is_file():
+                file_path.unlink()
+                logger.info(
+                    "Removed previous output before step: %s",
+                    file_path,
+                )
+            else:
+                raise RuntimeError(
+                    f"Expected output path is not a file: {file_path}"
+                )
+
+
+def verify_required_files(step_name):
     expected_files = STEP_OUTPUTS.get(step_name, [])
 
     for file_path in expected_files:
@@ -118,33 +148,74 @@ def verify_step_outputs(step_name):
                 f"{step_name} created an empty file: {file_path}"
             )
 
-    # Confirm that image generation produced at least one
-    # successfully generated image.
-    if step_name == "Image Generation":
-        report_path = OUTPUT_DIR / "image_generation_report.json"
 
+def verify_image_report():
+    report_path = OUTPUT_DIR / "image_generation_report.json"
+
+    if not report_path.is_file():
+        raise FileNotFoundError(
+            "Image generation report was not created."
+        )
+
+    try:
         with open(report_path, "r", encoding="utf-8") as file:
             image_report = json.load(file)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "Image generation report contains invalid JSON."
+        ) from error
 
-        if not isinstance(image_report, dict):
-            raise RuntimeError(
-                "Image generation report has an invalid format."
-            )
+    if not isinstance(image_report, dict):
+        raise RuntimeError(
+            "Image generation report has an invalid format."
+        )
 
-        images = image_report.get("images", [])
+    # Support both known report formats.
+    images = image_report.get("scene_images")
 
-        successful_images = [
-            item for item in images
-            if isinstance(item, dict)
-            and item.get("status") == "success"
-        ]
+    if not isinstance(images, list):
+        images = image_report.get("images")
 
-        if not successful_images:
-            raise RuntimeError(
-                "Image generation report contains no successful images."
-            )
+    if not isinstance(images, list):
+        raise RuntimeError(
+            "Image report does not contain a valid "
+            "'scene_images' or 'images' list."
+        )
+
+    successful_images = [
+        item for item in images
+        if isinstance(item, dict)
+        and str(item.get("status", "")).lower() == "success"
+    ]
+
+    if not successful_images:
+        raise RuntimeError(
+            "Image generation report contains no successful images."
+        )
+
+    logger.info(
+        "Image report verified: %d successful image entries.",
+        len(successful_images),
+    )
+
+    return {
+        "total_reported_images": len(images),
+        "successful_images": len(successful_images),
+        "status": "verified",
+    }
+
+
+def verify_step_outputs(step_name):
+    verify_required_files(step_name)
+
+    additional_report = None
+
+    if step_name == "Image Generation":
+        additional_report = verify_image_report()
 
     logger.info("%s output checks passed.", step_name)
+
+    return additional_report
 
 
 def run_step(step_name, script_name, report):
@@ -168,6 +239,9 @@ def run_step(step_name, script_name, report):
     start = time.monotonic()
 
     try:
+        # Prevent old files from making this run appear successful.
+        remove_old_step_outputs(step_name)
+
         result = subprocess.run(
             [
                 sys.executable,
@@ -186,9 +260,7 @@ def run_step(step_name, script_name, report):
                 f"{result.returncode}."
             )
 
-        # A zero exit code alone is not enough.
-        # Confirm that the expected output files exist.
-        verify_step_outputs(step_name)
+        additional_report = verify_step_outputs(step_name)
 
         step_report["status"] = "completed"
         step_report["finished_at"] = current_time()
@@ -196,6 +268,9 @@ def run_step(step_name, script_name, report):
             time.monotonic() - start,
             2,
         )
+
+        if additional_report is not None:
+            step_report["verification"] = additional_report
 
         report["completed_steps"].append(step_name)
         report["current_step"] = None
@@ -234,26 +309,32 @@ def verify_video():
             "Final video file is unexpectedly small."
         )
 
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v", "error",
-            "-show_entries",
-            "stream=codec_type,width,height",
-            "-show_entries",
-            "format=duration",
-            "-of", "json",
-            str(VIDEO_FILE),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries",
+                "stream=codec_type,width,height",
+                "-show_entries",
+                "format=duration",
+                "-of", "json",
+                str(VIDEO_FILE),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            "FFprobe timed out while checking the final video."
+        ) from error
 
     if result.returncode != 0:
         raise RuntimeError(
             "FFprobe could not validate the final video: "
-            + result.stderr[-2000:]
+            + (result.stderr or "")[-2000:]
         )
 
     try:
@@ -265,14 +346,21 @@ def verify_video():
 
     streams = data.get("streams", [])
 
+    if not isinstance(streams, list):
+        raise RuntimeError(
+            "FFprobe returned an invalid streams structure."
+        )
+
     video_streams = [
         stream for stream in streams
-        if stream.get("codec_type") == "video"
+        if isinstance(stream, dict)
+        and stream.get("codec_type") == "video"
     ]
 
     audio_streams = [
         stream for stream in streams
-        if stream.get("codec_type") == "audio"
+        if isinstance(stream, dict)
+        and stream.get("codec_type") == "audio"
     ]
 
     if not video_streams:
@@ -287,16 +375,25 @@ def verify_video():
 
     video = video_streams[0]
 
-    if video.get("width") != 1920 or video.get("height") != 1080:
+    if (
+        video.get("width") != EXPECTED_VIDEO_WIDTH
+        or video.get("height") != EXPECTED_VIDEO_HEIGHT
+    ):
         raise RuntimeError(
-            "Final video resolution is not 1920x1080."
+            "Final video resolution is not "
+            f"{EXPECTED_VIDEO_WIDTH}x{EXPECTED_VIDEO_HEIGHT}."
         )
 
-    duration = float(
-        data.get("format", {}).get("duration", 0)
-    )
+    duration_value = data.get("format", {}).get("duration")
 
-    if duration <= 0:
+    try:
+        duration = float(duration_value)
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "FFprobe returned an invalid video duration."
+        )
+
+    if not math.isfinite(duration) or duration <= 0:
         raise RuntimeError(
             "Final video duration is invalid."
         )
@@ -304,7 +401,9 @@ def verify_video():
     return {
         "file": str(VIDEO_FILE.relative_to(BASE_DIR)),
         "size_bytes": file_size,
-        "resolution": "1920x1080",
+        "resolution": (
+            f"{EXPECTED_VIDEO_WIDTH}x{EXPECTED_VIDEO_HEIGHT}"
+        ),
         "duration_seconds": round(duration, 2),
         "video_stream": True,
         "audio_stream": True,
@@ -318,18 +417,28 @@ def verify_thumbnail():
             f"Thumbnail not found: {THUMBNAIL_FILE}"
         )
 
-    with Image.open(THUMBNAIL_FILE) as image:
-        image.load()
+    try:
+        with Image.open(THUMBNAIL_FILE) as image:
+            image.load()
 
-        if image.size != (1280, 720):
-            raise RuntimeError(
-                f"Invalid thumbnail resolution: {image.size}"
-            )
+            if image.size != (
+                EXPECTED_THUMBNAIL_WIDTH,
+                EXPECTED_THUMBNAIL_HEIGHT,
+            ):
+                raise RuntimeError(
+                    "Invalid thumbnail resolution: "
+                    f"{image.size}"
+                )
 
-        if image.format != "JPEG":
-            raise RuntimeError(
-                f"Invalid thumbnail format: {image.format}"
-            )
+            if image.format != "JPEG":
+                raise RuntimeError(
+                    f"Invalid thumbnail format: {image.format}"
+                )
+
+    except UnidentifiedImageError as error:
+        raise RuntimeError(
+            "Thumbnail is not a valid image file."
+        ) from error
 
     file_size = THUMBNAIL_FILE.stat().st_size
 
@@ -341,7 +450,10 @@ def verify_thumbnail():
     return {
         "file": str(THUMBNAIL_FILE.relative_to(BASE_DIR)),
         "size_bytes": file_size,
-        "resolution": "1280x720",
+        "resolution": (
+            f"{EXPECTED_THUMBNAIL_WIDTH}x"
+            f"{EXPECTED_THUMBNAIL_HEIGHT}"
+        ),
         "format": "JPEG",
         "status": "verified",
     }
@@ -426,9 +538,13 @@ def main():
         report["status"] = "failed"
         report["error"] = str(error)
         report["finished_at"] = current_time()
+        report["current_step"] = None
 
         if report["validation_status"] == "pending":
             report["validation_status"] = "failed"
+
+        if report["failed_step"] is None:
+            report["failed_step"] = "Project Validation"
 
         save_report(report)
 
