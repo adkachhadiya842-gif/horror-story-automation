@@ -40,10 +40,11 @@ jobs:
           mkdir -p output/subtitles
           mkdir -p output/thumbnail
 
-      - name: Run horror production pipeline
+            - name: Run horror production pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           python scripts/pipeline.py
 
