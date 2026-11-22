@@ -51,10 +51,10 @@
     "width": 1280,
     "height": 720
   },
-  "generation": {
-    "image_model": "gemini-2.5-flash-image",
-    "text_model": "gemini-2.5-flash",
-    "max_retries": 3,
-    "retry_delay_seconds": 5
-  }
+ "generation": {
+  "image_model": "gemini-2.5-flash-image",
+  "text_model": "gemini-3.8-flash",
+  "max_retries": 3,
+  "retry_delay_seconds": 5
+}
 }
