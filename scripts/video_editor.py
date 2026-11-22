@@ -311,8 +311,7 @@ def get_audio_info(audio_path):
 
 def get_current_run_images():
     """
-    Read only successful scene images from the current
-    image_generation_report.json.
+    Read only successful scene images from current report.
     """
 
     report = load_json(IMAGE_REPORT_FILE)
@@ -452,7 +451,7 @@ def allocate_frames(weights, total_frames):
 
     if total_frames < len(weights):
         raise ValueError(
-            "Narration is too short for the number of scene images."
+            "Narration is too short for scene images."
         )
 
     weights = [
@@ -539,7 +538,7 @@ def calculate_transition_frames(
 
 
 # --------------------------------------------------
-# CAMERA MOVEMENT
+# CAMERA MOVEMENT - FIXED
 # --------------------------------------------------
 
 def create_camera_filter(
@@ -552,20 +551,16 @@ def create_camera_filter(
     pan_enabled,
 ):
     """
-    Zoom and pan behavior:
+    Safe FFmpeg zoompan expressions.
 
-    Both disabled:
-        Fit and crop to the target frame without extra zoom.
-
-    Zoom only:
-        Centered alternating zoom.
-
-    Pan only:
-        Constant slight zoom provides room for pan movement.
-
-    Both enabled:
-        Alternating zoom with directional pan.
+    Alternating zoom and directional pan.
+    Uses d+1 to avoid invalid max() expression parsing.
     """
+
+    if frame_count <= 0:
+        raise ValueError(
+            "Camera frame count must be positive."
+        )
 
     if not zoom_enabled and not pan_enabled:
         return ",".join([
@@ -578,7 +573,6 @@ def create_camera_filter(
             "format=yuv420p",
         ])
 
-    # Extra image area is needed for camera movement.
     scale_width = round(width * 1.18)
     scale_height = round(height * 1.18)
 
@@ -602,7 +596,6 @@ def create_camera_filter(
                 "max(zoom-0.0007,1.0))"
             )
     elif pan_enabled:
-        # A fixed zoom is required to create a movable crop area.
         zoom_expression = "1.08"
     else:
         zoom_expression = "1.0"
@@ -612,7 +605,7 @@ def create_camera_filter(
 
         if direction == 0:
             x_expression = (
-                "(iw-iw/zoom)*on/max(d-1,1)"
+                "(iw-iw/zoom)*on/(d+1)"
             )
             y_expression = (
                 "ih/2-ih/zoom/2"
@@ -620,7 +613,7 @@ def create_camera_filter(
 
         elif direction == 1:
             x_expression = (
-                "(iw-iw/zoom)*(1-on/max(d-1,1))"
+                "(iw-iw/zoom)*(1-on/(d+1))"
             )
             y_expression = (
                 "ih/2-ih/zoom/2"
@@ -631,7 +624,7 @@ def create_camera_filter(
                 "iw/2-iw/zoom/2"
             )
             y_expression = (
-                "(ih-ih/zoom)*on/max(d-1,1)"
+                "(ih-ih/zoom)*on/(d+1)"
             )
 
         else:
@@ -639,7 +632,7 @@ def create_camera_filter(
                 "iw/2-iw/zoom/2"
             )
             y_expression = (
-                "(ih-ih/zoom)*(1-on/max(d-1,1))"
+                "(ih-ih/zoom)*(1-on/(d+1))"
             )
 
     else:
@@ -725,14 +718,6 @@ def create_transition_video(
     fps,
     output_path,
 ):
-    """
-    Join clips with xfade.
-
-    Scene clips before the final scene contain extra outgoing
-    transition frames. Therefore cumulative base-frame offsets
-    preserve the exact intended total timeline.
-    """
-
     if not clip_paths:
         raise ValueError(
             "No scene clips supplied."
@@ -740,7 +725,7 @@ def create_transition_video(
 
     if len(clip_paths) != len(base_allocations):
         raise ValueError(
-            "Clip count and frame allocation count do not match."
+            "Clip count and frame allocation mismatch."
         )
 
     if len(clip_paths) == 1 or transition_frames <= 0:
@@ -947,7 +932,7 @@ def validate_srt(audio_duration):
 
         if end > audio_duration + 0.25:
             raise ValueError(
-                "Subtitle timestamps exceed selected audio duration."
+                "Subtitle timestamps exceed audio duration."
             )
 
         subtitle_text = lines[2:]
@@ -995,7 +980,7 @@ def check_subtitle_support():
         filters_result.stdout,
     ):
         raise RuntimeError(
-            "FFmpeg subtitles filter is unavailable. "
+            "FFmpeg subtitles filter unavailable. "
             "Install FFmpeg with libass support."
         )
 
@@ -1013,7 +998,7 @@ def check_subtitle_support():
         or not Path(font_path).is_file()
     ):
         raise RuntimeError(
-            "Noto Sans Devanagari font was not found."
+            "Noto Sans Devanagari font not found."
         )
 
     return font_path
@@ -1195,7 +1180,7 @@ def create_video():
 
     if total_frames < len(images):
         raise RuntimeError(
-            "Audio is too short for the number of scene images."
+            "Audio is too short for scene images."
         )
 
     weights = get_scene_weights(
@@ -1214,7 +1199,6 @@ def create_video():
         fps,
     )
 
-    # Add outgoing transition frames to every clip except the last.
     clip_allocations = list(base_allocations)
 
     if transition_frames > 0:
@@ -1374,7 +1358,7 @@ def create_video():
 
     if audio_video_difference > allowed_difference:
         raise RuntimeError(
-            "Video stream and audio stream duration mismatch."
+            "Video and audio stream duration mismatch."
         )
 
     report = {
