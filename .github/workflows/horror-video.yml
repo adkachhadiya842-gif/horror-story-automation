@@ -25,8 +25,33 @@ jobs:
       - name: Install FFmpeg and Hindi fonts
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-core
+          sudo apt-get install -y ffmpeg fonts-noto-core fontconfig
           fc-cache -f -v
+
+      - name: Verify FFmpeg and Hindi font support
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking FFmpeg..."
+          ffmpeg -version
+
+          echo "Checking subtitles filter..."
+          ffmpeg -hide_banner -filters | grep subtitles
+
+          echo "Checking drawtext filter..."
+          ffmpeg -hide_banner -filters | grep drawtext
+
+          echo "Checking drawtext text shaping support..."
+          ffmpeg -hide_banner -h filter=drawtext 2>&1 | grep text_shaping
+
+          echo "Checking Hindi font files..."
+          test -f /usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf
+          test -f /usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf
+
+          fc-match "Noto Sans Devanagari"
+
+          echo "FFmpeg and Hindi font checks passed."
 
       - name: Install Python packages
         run: |
@@ -39,6 +64,7 @@ jobs:
           mkdir -p output/audio
           mkdir -p output/subtitles
           mkdir -p output/thumbnail
+          mkdir -p output/assets
 
       - name: Run horror production pipeline
         env:
