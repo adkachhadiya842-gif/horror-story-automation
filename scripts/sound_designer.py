@@ -1,18 +1,18 @@
 
 """
 Hindi Horror Story Automation
-Sound Designer - V2
+Sound Designer - V3
 
 Features:
-- Preserves original narration duration.
-- Adds optional ambience and background music.
-- Matches sound effects using Hindi and English filenames.
-- Creates scene-wise sound design plans.
-- Prevents sound effects from extending beyond narration.
-- Uses safer audio mixing levels.
-- Generates detailed JSON reports.
+- Preserves exact narration duration.
+- Uses optional ambience and background music.
+- Detects sound cues from explicit scene fields and scene descriptions.
+- Supports Hindi and English cue keywords.
+- Matches the supplied WAV sound-effect filenames.
+- Places effects within estimated scene boundaries.
+- Creates sound design plan and detailed JSON report.
 
-Audio assets must be supplied by the user.
+Timing is scene-based estimation, not exact speech alignment.
 """
 
 import json
@@ -23,10 +23,7 @@ from pathlib import Path
 
 from pydub import AudioSegment
 
-from scripts.utils import (
-    OUTPUT_DIR,
-    create_project_directories,
-)
+from scripts.utils import OUTPUT_DIR, create_project_directories
 
 
 LOGGER = logging.getLogger("horror_sound_designer")
@@ -38,76 +35,87 @@ ANALYSIS_FILE = OUTPUT / "story_analysis.json"
 NARRATION_FILE = OUTPUT / "audio" / "narration.wav"
 
 SOUND_ROOT = ROOT / "input" / "sounds"
-
 AMBIENCE_DIR = SOUND_ROOT / "ambience"
 MUSIC_DIR = SOUND_ROOT / "music"
 EFFECTS_DIR = SOUND_ROOT / "effects"
 
 AUDIO_DIR = OUTPUT / "audio"
-
 PLAN_FILE = AUDIO_DIR / "sound_design_plan.json"
 REPORT_FILE = AUDIO_DIR / "sound_design_report.json"
 FINAL_AUDIO = AUDIO_DIR / "final_audio.wav"
 
-SUPPORTED_FORMATS = {
-    ".wav", ".mp3", ".ogg", ".flac", ".m4a"
-}
+SUPPORTED_FORMATS = {".wav", ".mp3", ".ogg", ".flac", ".m4a"}
 
-# Mixing levels.
+# Mixing levels in decibels.
 NARRATION_GAIN = -1.0
-AMBIENCE_GAIN = -32
-MUSIC_GAIN = -28
-EFFECT_GAIN = -18
+AMBIENCE_GAIN = -32.0
+MUSIC_GAIN = -28.0
+EFFECT_GAIN = -18.0
 
-AUDIO_FADE_MS = 1500
+AUDIO_FADE_MS = 1200
+MIN_EFFECT_GAP_MS = 1800
 
-# Common Hindi-to-English sound filename aliases.
-SOUND_ALIASES = {
-    "दरवाजा": ["door", "door_creak", "door_open"],
-    "दरवाज़ा": ["door", "door_creak", "door_open"],
-    "दरवाजा खुलना": ["door_open", "door"],
-    "दरवाजा बंद": ["door_close", "door_slam"],
-    "कदम": ["footsteps", "footstep", "walking"],
-    "पैरों की आवाज": ["footsteps", "walking"],
-    "चलना": ["footsteps", "walking"],
-    "हवा": ["wind", "howling_wind"],
-    "आंधी": ["storm", "wind"],
-    "बारिश": ["rain", "heavy_rain"],
-    "बिजली": ["thunder", "lightning"],
-    "गरज": ["thunder", "storm"],
-    "चीख": ["scream", "horror_scream"],
-    "चिल्लाना": ["scream", "shout"],
-    "हंसी": ["evil_laugh", "laugh"],
-    "हँसी": ["evil_laugh", "laugh"],
-    "रोना": ["crying", "sobbing"],
-    "सांस": ["breathing", "heavy_breathing"],
-    "साँस": ["breathing", "heavy_breathing"],
-    "दिल": ["heartbeat", "heart_beat"],
-    "धड़कन": ["heartbeat", "heart_beat"],
-    "घड़ी": ["clock", "ticking_clock"],
-    "ट्रेन": ["train", "train_passing"],
-    "सीटी": ["whistle", "train_whistle"],
-    "खिड़की": ["window", "window_creak"],
-    "कांच": ["glass", "glass_break"],
-    "शीशा": ["glass", "glass_break"],
-    "पानी": ["water", "dripping_water"],
-    "बूंद": ["water_drip", "dripping"],
-    "ताला": ["lock", "door_lock"],
-    "जंजीर": ["chain", "chains"],
-    "घंटी": ["bell", "church_bell"],
-    "फुसफुसाना": ["whisper", "whispering"],
-    "फुसफुसाहट": ["whisper", "whispering"],
-    "धमाका": ["impact", "explosion", "boom"],
-    "गिरना": ["fall", "impact", "body_fall"],
-    "मशीन": ["machine", "mechanical"],
-    "इंजन": ["engine", "train_engine"],
-    "सन्नाटा": ["silence", "dark_ambience"],
+# Each key corresponds to the supplied effect filename.
+EFFECT_KEYWORDS = {
+    "door_creak": [
+        "door", "door creak", "door open", "door close",
+        "दरवाजा", "दरवाज़ा", "दरवाजा खुला",
+        "दरवाज़ा खुला", "दरवाजा बंद", "दरवाज़ा बंद",
+        "दरवाजा खुलना", "दरवाज़ा खुलना",
+        "दरवाजे की आवाज", "दरवाज़े की आवाज",
+        "दरवाजा चरमराना", "किवाड़",
+    ],
+    "footsteps": [
+        "footsteps", "footstep", "walking", "walk",
+        "running footsteps", "steps",
+        "कदम", "कदमों की आवाज", "पैरों की आवाज",
+        "चलने की आवाज", "चलना", "दौड़ना",
+        "किसी के चलने", "पैरों की आहट",
+    ],
+    "heartbeat": [
+        "heartbeat", "heart beat", "heart beating",
+        "fast heartbeat", "heart pounding",
+        "दिल की धड़कन", "दिल धड़कना",
+        "धड़कन", "तेज धड़कन", "दिल",
+    ],
+    "thunder": [
+        "thunder", "thunderstorm", "lightning",
+        "storm", "thunder clap",
+        "बिजली", "बादलों की गरज", "गरज",
+        "बादल गरजना", "आकाशीय बिजली",
+        "तूफान", "आंधी",
+    ],
+    "train_whistle": [
+        "train whistle", "train horn", "whistle",
+        "train passing", "railway whistle",
+        "ट्रेन की सीटी", "रेल की सीटी",
+        "सीटी", "ट्रेन", "रेलगाड़ी", "रेल गाड़ी",
+        "रेल", "भाप का इंजन",
+    ],
 }
+
+# Explicit scene fields that may contain sound descriptions.
+CUE_FIELDS = (
+    "sound_effects",
+    "sound_design",
+    "audio_cues",
+    "sound_cues",
+    "sfx",
+)
+
+# Text fields used for fallback sound detection.
+SCENE_TEXT_FIELDS = (
+    "story_event",
+    "visual_description",
+    "scene_title",
+    "image_prompt",
+    "description",
+    "narration",
+    "dialogue",
+)
 
 
 def setup_logging():
-    """Initialize logging."""
-
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
@@ -125,8 +133,6 @@ def setup_logging():
 
 
 def prepare_directories():
-    """Create required directories."""
-
     create_project_directories()
 
     for folder in (
@@ -139,41 +145,26 @@ def prepare_directories():
 
 
 def load_json(path):
-    """Load JSON file."""
-
     if not path.is_file():
-        raise FileNotFoundError(
-            f"Required file missing: {path}"
-        )
+        raise FileNotFoundError(f"Required file missing: {path}")
 
     with open(path, "r", encoding="utf-8") as file:
         data = json.load(file)
 
     if not isinstance(data, dict):
-        raise ValueError(
-            f"Invalid JSON object: {path}"
-        )
+        raise ValueError(f"Invalid JSON object: {path}")
 
     return data
 
 
 def save_json(data, path):
-    """Save JSON report."""
-
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(path, "w", encoding="utf-8") as file:
-        json.dump(
-            data,
-            file,
-            ensure_ascii=False,
-            indent=4,
-        )
+        json.dump(data, file, ensure_ascii=False, indent=4)
 
 
 def load_narration():
-    """Load original narration audio."""
-
     if not NARRATION_FILE.is_file():
         raise FileNotFoundError(
             f"Narration missing: {NARRATION_FILE}"
@@ -187,20 +178,18 @@ def load_narration():
     return audio.set_channels(2)
 
 
-def get_scene_cues(scene):
-    """Extract sound-effect cues from scene data."""
+def normalize_text(value):
+    """Normalize English and Devanagari text for matching."""
+    value = unicodedata.normalize("NFKC", str(value)).lower()
+    value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
+    return " ".join(value.split())
 
-    fields = (
-        "sound_effects",
-        "sound_design",
-        "audio_cues",
-        "sound_cues",
-        "sfx",
-    )
 
+def collect_explicit_cues(scene):
+    """Read sound cues already present in the scene analysis."""
     cues = []
 
-    for field in fields:
+    for field in CUE_FIELDS:
         value = scene.get(field)
 
         if isinstance(value, str) and value.strip():
@@ -208,7 +197,6 @@ def get_scene_cues(scene):
 
         elif isinstance(value, list):
             for item in value:
-
                 if isinstance(item, str) and item.strip():
                     cues.append(item.strip())
 
@@ -217,55 +205,70 @@ def get_scene_cues(scene):
                         item.get("description")
                         or item.get("sound")
                         or item.get("name")
+                        or item.get("effect")
                     )
 
                     if description:
                         cues.append(str(description).strip())
 
-    # Remove duplicate cue descriptions.
     return list(dict.fromkeys(cues))
 
 
-def get_scene_weight(scene):
-    """Estimate visual scene importance."""
+def collect_scene_text(scene):
+    """Combine useful scene fields for fallback detection."""
+    parts = []
 
-    fields = (
-        "story_event",
-        "visual_description",
-        "scene_title",
-        "image_prompt",
-    )
-
-    for field in fields:
+    for field in SCENE_TEXT_FIELDS:
         value = scene.get(field)
 
         if isinstance(value, str) and value.strip():
-            return max(len(value.strip()), 1)
+            parts.append(value.strip())
 
-    return 1
+    return " ".join(parts)
+
+
+def detect_fallback_cues(scene_text):
+    """Detect known sound effects from Hindi/English scene text."""
+    normalized_scene = normalize_text(scene_text)
+    detected = []
+
+    for effect_name, keywords in EFFECT_KEYWORDS.items():
+        for keyword in keywords:
+            normalized_keyword = normalize_text(keyword)
+
+            if not normalized_keyword:
+                continue
+
+            # Match complete phrases, not arbitrary substrings.
+            padded_scene = f" {normalized_scene} "
+            padded_keyword = f" {normalized_keyword} "
+
+            if padded_keyword in padded_scene:
+                detected.append(effect_name)
+                break
+
+    return detected
+
+
+def get_scene_cues(scene):
+    """Combine explicit cues with fallback text detection."""
+    explicit = collect_explicit_cues(scene)
+    detected = detect_fallback_cues(collect_scene_text(scene))
+
+    return list(dict.fromkeys(explicit + detected))
+
+
+def get_scene_weight(scene):
+    text = collect_scene_text(scene)
+    return max(len(text), 1)
 
 
 def build_scene_timeline(scenes, total_duration_ms):
-    """
-    Estimate scene boundaries.
-
-    V2 uses visual event descriptions because exact speech
-    alignment is not yet implemented.
-    """
-
     if not scenes:
         raise ValueError("No scenes found in story analysis.")
 
-    weights = [
-        get_scene_weight(scene)
-        for scene in scenes
-    ]
-
-    total_weight = sum(weights)
-
-    if total_weight <= 0:
-        weights = [1] * len(scenes)
-        total_weight = len(scenes)
+    weights = [get_scene_weight(scene) for scene in scenes]
+    total_weight = sum(weights) or len(scenes)
 
     timeline = []
     current_ms = 0
@@ -274,18 +277,11 @@ def build_scene_timeline(scenes, total_duration_ms):
         zip(scenes, weights),
         start=1,
     ):
-
         if index == len(scenes):
             end_ms = total_duration_ms
-
         else:
-            estimated_duration = (
-                total_duration_ms * weight / total_weight
-            )
-
-            end_ms = current_ms + round(
-                estimated_duration
-            )
+            estimated = total_duration_ms * weight / total_weight
+            end_ms = current_ms + round(estimated)
 
         end_ms = min(end_ms, total_duration_ms)
 
@@ -296,13 +292,11 @@ def build_scene_timeline(scenes, total_duration_ms):
             "start_seconds": round(current_ms / 1000, 3),
             "end_seconds": round(end_ms / 1000, 3),
             "duration_seconds": round(
-                (end_ms - current_ms) / 1000,
-                3,
+                (end_ms - current_ms) / 1000, 3
             ),
             "sound_cues": get_scene_cues(scene),
             "visual_description": scene.get(
-                "visual_description",
-                "",
+                "visual_description", ""
             ),
         })
 
@@ -310,29 +304,24 @@ def build_scene_timeline(scenes, total_duration_ms):
 
     if current_ms != total_duration_ms:
         raise RuntimeError(
-            "Scene timeline does not cover the complete narration."
+            "Scene timeline does not cover complete narration."
         )
 
     return timeline
 
 
 def find_audio_files(folder):
-    """Find supported audio files."""
-
     if not folder.exists():
         return []
 
     return sorted(
-        path
-        for path in folder.rglob("*")
+        path for path in folder.rglob("*")
         if path.is_file()
         and path.suffix.lower() in SUPPORTED_FORMATS
     )
 
 
 def load_audio_file(path):
-    """Load audio safely."""
-
     try:
         audio = AudioSegment.from_file(str(path))
 
@@ -342,18 +331,11 @@ def load_audio_file(path):
         return audio.set_channels(2)
 
     except Exception as error:
-        LOGGER.warning(
-            "Could not load audio %s: %s",
-            path,
-            error,
-        )
-
+        LOGGER.warning("Could not load %s: %s", path, error)
         return None
 
 
 def fit_audio(audio, target_duration_ms):
-    """Loop or trim audio to exact target duration."""
-
     if target_duration_ms <= 0:
         return AudioSegment.empty()
 
@@ -363,52 +345,30 @@ def fit_audio(audio, target_duration_ms):
             frame_rate=44100,
         ).set_channels(2)
 
-    repetitions = (
-        target_duration_ms // len(audio)
-    ) + 1
-
+    repetitions = (target_duration_ms // len(audio)) + 1
     return (audio * repetitions)[:target_duration_ms]
 
 
 def apply_fade(audio):
-    """Apply safe fades."""
-
     if len(audio) <= 0:
         return audio
 
-    fade_length = min(
-        AUDIO_FADE_MS,
-        len(audio) // 3,
-    )
+    fade_length = min(AUDIO_FADE_MS, len(audio) // 3)
 
     if fade_length <= 0:
         return audio
 
-    return (
-        audio
-        .fade_in(fade_length)
-        .fade_out(fade_length)
-    )
+    return audio.fade_in(fade_length).fade_out(fade_length)
 
 
 def choose_background_track(folder, category):
-    """Choose a background track."""
-
     files = find_audio_files(folder)
 
     if not files:
-        LOGGER.warning(
-            "No %s assets found in %s",
-            category,
-            folder,
-        )
+        LOGGER.warning("No %s audio found in %s", category, folder)
         return None
 
-    preferred_names = {
-        "default",
-        "main",
-        "background",
-    }
+    preferred_names = {"default", "main", "background"}
 
     for path in files:
         if path.stem.lower() in preferred_names:
@@ -417,97 +377,56 @@ def choose_background_track(folder, category):
     return files[0]
 
 
-def normalize_filename(value):
-    """
-    Normalize Hindi and English text.
-
-    Unlike the previous version, this preserves Unicode
-    letters so Devanagari filenames can be matched.
-    """
-
-    value = unicodedata.normalize(
-        "NFKC",
-        str(value).lower(),
-    )
-
-    value = "".join(
-        char if char.isalnum() else " "
-        for char in value
-    )
-
-    return set(value.split())
-
-
-def expand_cue_keywords(cue):
-    """Expand Hindi cue keywords into English aliases."""
-
-    keywords = normalize_filename(cue)
-
-    for hindi_term, aliases in SOUND_ALIASES.items():
-
-        if hindi_term in cue:
-            for alias in aliases:
-                keywords.update(
-                    normalize_filename(alias)
-                )
-
-    return keywords
-
-
 def find_matching_effect(cue, effect_files):
-    """Find the best matching effect asset."""
+    """Match a cue to the best available audio filename."""
+    normalized_cue = normalize_text(cue)
 
-    cue_words = expand_cue_keywords(cue)
+    # Strong match for known canonical effect names.
+    for effect_name, keywords in EFFECT_KEYWORDS.items():
+        if normalize_text(effect_name) == normalized_cue:
+            for path in effect_files:
+                if path.stem.lower() == effect_name:
+                    return path
 
     best_match = None
     best_score = 0
 
+    cue_words = set(normalized_cue.split())
+
     for path in effect_files:
+        filename = normalize_text(path.stem)
+        filename_words = set(filename.split())
 
-        filename_words = normalize_filename(
-            path.stem
-        )
+        score = len(cue_words.intersection(filename_words))
 
-        score = len(
-            cue_words.intersection(filename_words)
-        )
+        for effect_name, keywords in EFFECT_KEYWORDS.items():
+            if path.stem.lower() == effect_name:
+                for keyword in keywords:
+                    keyword_text = normalize_text(keyword)
+
+                    if keyword_text and keyword_text in normalized_cue:
+                        score += 5
 
         if score > best_score:
             best_score = score
             best_match = path
 
-    if best_score <= 0:
-        return None
-
-    return best_match
+    return best_match if best_score > 0 else None
 
 
 def build_effect_matches(timeline, effect_files):
-    """Match sound effects once and reuse the result."""
-
     matches = []
 
     for scene in timeline:
-
         scene_effects = []
 
         for cue in scene["sound_cues"]:
-
-            matching_file = find_matching_effect(
-                cue,
-                effect_files,
-            )
+            matching_file = find_matching_effect(cue, effect_files)
 
             scene_effects.append({
                 "cue": cue,
-                "asset": (
-                    str(matching_file)
-                    if matching_file else None
-                ),
-                "status": (
-                    "matched"
-                    if matching_file else "missing"
-                ),
+                "asset": str(matching_file) if matching_file else None,
+                "status": "matched" if matching_file else "missing",
             })
 
         matches.append({
@@ -518,14 +437,7 @@ def build_effect_matches(timeline, effect_files):
     return matches
 
 
-def build_sound_plan(
-    timeline,
-    ambience_path,
-    music_path,
-    effect_matches,
-):
-    """Build detailed scene-wise sound plan."""
-
+def build_sound_plan(timeline, ambience_path, music_path, effect_matches):
     match_lookup = {
         str(item["scene_number"]): item["effects"]
         for item in effect_matches
@@ -534,20 +446,12 @@ def build_sound_plan(
     plan = []
 
     for scene in timeline:
-
         plan.append({
             **scene,
-            "ambience_asset": (
-                str(ambience_path)
-                if ambience_path else None
-            ),
-            "music_asset": (
-                str(music_path)
-                if music_path else None
-            ),
+            "ambience_asset": str(ambience_path) if ambience_path else None,
+            "music_asset": str(music_path) if music_path else None,
             "effects": match_lookup.get(
-                str(scene["scene_number"]),
-                [],
+                str(scene["scene_number"]), []
             ),
         })
 
@@ -561,93 +465,65 @@ def mix_audio(
     music_path,
     effect_matches,
 ):
-    """Mix narration, background layers and sound effects."""
-
     total_duration = len(narration)
 
-    # Keep narration as the main foreground layer.
-    narration_track = (
+    final_mix = (
         narration
         .apply_gain(NARRATION_GAIN)
         .set_channels(2)
     )
 
-    final_mix = narration_track
-
-    # Background ambience.
+    # Continuous ambience.
     if ambience_path:
-
         ambience = load_audio_file(ambience_path)
 
         if ambience:
+            ambience = fit_audio(ambience, total_duration)
+            ambience = apply_fade(ambience).apply_gain(AMBIENCE_GAIN)
+            final_mix = final_mix.overlay(ambience)
 
-            ambience = fit_audio(
-                ambience,
-                total_duration,
-            )
-
-            ambience = (
-                apply_fade(ambience)
-                .apply_gain(AMBIENCE_GAIN)
-            )
-
-            final_mix = final_mix.overlay(
-                ambience
-            )
-
-    # Background music.
+    # Continuous background music.
     if music_path:
-
         music = load_audio_file(music_path)
 
         if music:
-
-            music = fit_audio(
-                music,
-                total_duration,
-            )
-
-            music = (
-                apply_fade(music)
-                .apply_gain(MUSIC_GAIN)
-            )
-
-            final_mix = final_mix.overlay(
-                music
-            )
+            music = fit_audio(music, total_duration)
+            music = apply_fade(music).apply_gain(MUSIC_GAIN)
+            final_mix = final_mix.overlay(music)
 
     matched_effects = []
     missing_effects = []
+    last_effect_time = {}
 
-    # Scene-specific effects.
-    for scene, match_group in zip(
-        timeline,
-        effect_matches,
-    ):
-
+    # Scene-based effect placement.
+    for scene, match_group in zip(timeline, effect_matches):
         start_ms = scene["start_ms"]
         end_ms = scene["end_ms"]
-
         scene_duration = end_ms - start_ms
 
         if scene_duration <= 0:
             continue
 
         for effect_info in match_group["effects"]:
-
             cue = effect_info["cue"]
             asset = effect_info["asset"]
 
             if not asset:
-
                 missing_effects.append({
                     "scene_number": scene["scene_number"],
                     "cue": cue,
+                    "reason": "no_matching_asset",
                 })
-
                 continue
 
             effect_path = Path(asset)
+
+            # Avoid repeating the same effect too frequently.
+            effect_key = effect_path.stem.lower()
+            previous_time = last_effect_time.get(effect_key, -MIN_EFFECT_GAP_MS)
+
+            if start_ms - previous_time < MIN_EFFECT_GAP_MS:
+                continue
 
             effect = load_audio_file(effect_path)
 
@@ -659,51 +535,40 @@ def mix_audio(
                 })
                 continue
 
-            # Effects are kept inside their scene boundary.
-            effect = effect[:scene_duration]
+            # Place effect around the middle of the scene.
+            # This is estimated timing, not speech synchronization.
+            offset_ms = start_ms + int(scene_duration * 0.35)
+            available_duration = total_duration - offset_ms
 
-            effect = (
-                apply_fade(effect)
-                .apply_gain(EFFECT_GAIN)
-                .set_channels(2)
-            )
+            if available_duration <= 0:
+                continue
 
-            # Ensure the effect cannot extend past narration.
-            available_duration = total_duration - start_ms
-
-            effect = effect[:available_duration]
+            effect = effect[:min(scene_duration, available_duration)]
+            effect = apply_fade(effect).apply_gain(EFFECT_GAIN).set_channels(2)
 
             if len(effect) <= 0:
                 continue
 
-            final_mix = final_mix.overlay(
-                effect,
-                position=start_ms,
-            )
+            final_mix = final_mix.overlay(effect, position=offset_ms)
+            last_effect_time[effect_key] = offset_ms
 
             matched_effects.append({
                 "scene_number": scene["scene_number"],
                 "cue": cue,
                 "asset": str(effect_path),
-                "start_ms": start_ms,
+                "start_ms": offset_ms,
                 "duration_ms": len(effect),
             })
 
-    # Safety headroom. This can slightly lower all layers
-    # only when the combined mix would otherwise clip.
+    # Prevent digital clipping while retaining headroom.
     if final_mix.max_dBFS > -1.0:
         safety_gain = -1.0 - final_mix.max_dBFS
-
         LOGGER.warning(
-            "Mix peak was high. Applying %.2f dB safety reduction.",
+            "Applying %.2f dB safety reduction to final mix.",
             safety_gain,
         )
+        final_mix = final_mix.apply_gain(safety_gain)
 
-        final_mix = final_mix.apply_gain(
-            safety_gain
-        )
-
-    # Guarantee exact narration duration.
     final_mix = final_mix[:total_duration]
 
     if len(final_mix) != total_duration:
@@ -711,62 +576,40 @@ def mix_audio(
             "Final audio duration differs from narration."
         )
 
-    return (
-        final_mix,
-        matched_effects,
-        missing_effects,
-    )
+    return final_mix, matched_effects, missing_effects
 
 
 def main():
-    """Run the complete sound design pipeline."""
-
     setup_logging()
     prepare_directories()
 
-    LOGGER.info("Starting Sound Designer V2.")
+    LOGGER.info("Starting Sound Designer V3.")
 
     analysis = load_json(ANALYSIS_FILE)
-
     scenes = analysis.get("scenes", [])
 
     if not isinstance(scenes, list) or not scenes:
-        raise ValueError(
-            "Story analysis contains no valid scenes."
-        )
+        raise ValueError("Story analysis contains no valid scenes.")
 
     narration = load_narration()
-
     total_duration_ms = len(narration)
 
-    timeline = build_scene_timeline(
-        scenes,
-        total_duration_ms,
-    )
+    timeline = build_scene_timeline(scenes, total_duration_ms)
 
     ambience_path = choose_background_track(
-        AMBIENCE_DIR,
-        "ambience",
+        AMBIENCE_DIR, "ambience"
     )
-
     music_path = choose_background_track(
-        MUSIC_DIR,
-        "music",
+        MUSIC_DIR, "music"
     )
+    effect_files = find_audio_files(EFFECTS_DIR)
 
-    effect_files = find_audio_files(
-        EFFECTS_DIR
-    )
+    LOGGER.info("Available sound effects: %d", len(effect_files))
 
-    LOGGER.info(
-        "Available sound effects: %d",
-        len(effect_files),
-    )
+    for path in effect_files:
+        LOGGER.info("Found effect asset: %s", path.name)
 
-    effect_matches = build_effect_matches(
-        timeline,
-        effect_files,
-    )
+    effect_matches = build_effect_matches(timeline, effect_files)
 
     sound_plan = build_sound_plan(
         timeline,
@@ -774,11 +617,7 @@ def main():
         music_path,
         effect_matches,
     )
-
-    save_json(
-        sound_plan,
-        PLAN_FILE,
-    )
+    save_json(sound_plan, PLAN_FILE)
 
     final_mix, matched, missing = mix_audio(
         narration,
@@ -788,20 +627,10 @@ def main():
         effect_matches,
     )
 
-    FINAL_AUDIO.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    FINAL_AUDIO.parent.mkdir(parents=True, exist_ok=True)
+    final_mix.export(str(FINAL_AUDIO), format="wav")
 
-    final_mix.export(
-        str(FINAL_AUDIO),
-        format="wav",
-    )
-
-    # Verify exported audio.
-    verification = AudioSegment.from_file(
-        str(FINAL_AUDIO)
-    )
+    verification = AudioSegment.from_file(str(FINAL_AUDIO))
 
     if len(verification) != total_duration_ms:
         raise RuntimeError(
@@ -809,26 +638,15 @@ def main():
         )
 
     if verification.channels != 2:
-        raise RuntimeError(
-            "Final audio must be stereo."
-        )
+        raise RuntimeError("Final audio must be stereo.")
 
     report = {
         "status": "success",
-        "version": "V2",
-        "total_duration_seconds": round(
-            total_duration_ms / 1000,
-            3,
-        ),
+        "version": "V3",
+        "total_duration_seconds": round(total_duration_ms / 1000, 3),
         "total_scenes": len(scenes),
-        "ambience_asset": (
-            str(ambience_path)
-            if ambience_path else None
-        ),
-        "music_asset": (
-            str(music_path)
-            if music_path else None
-        ),
+        "ambience_asset": str(ambience_path) if ambience_path else None,
+        "music_asset": str(music_path) if music_path else None,
         "available_effect_assets": len(effect_files),
         "matched_effect_count": len(matched),
         "missing_effect_count": len(missing),
@@ -838,39 +656,26 @@ def main():
         "sound_design_plan": str(PLAN_FILE),
         "audio_channels": verification.channels,
         "audio_frame_rate": verification.frame_rate,
-        "audio_peak_dbfs": round(
-            verification.max_dBFS,
-            2,
-        ),
-        "timing_method": "estimated_visual_scene_timing",
+        "audio_peak_dbfs": round(verification.max_dBFS, 2),
+        "timing_method": "estimated_scene_based_timing",
         "exact_speech_alignment": False,
         "duration_verified": True,
     }
 
-    save_json(
-        report,
-        REPORT_FILE,
-    )
+    save_json(report, REPORT_FILE)
 
     LOGGER.info("-----------------------------------")
-    LOGGER.info("SOUND DESIGN V2 COMPLETED")
+    LOGGER.info("SOUND DESIGN V3 COMPLETED")
     LOGGER.info("Final audio: %s", FINAL_AUDIO)
-    LOGGER.info(
-        "Duration: %.2f seconds",
-        len(verification) / 1000,
-    )
+    LOGGER.info("Duration: %.2f seconds", len(verification) / 1000)
     LOGGER.info("Matched effects: %d", len(matched))
     LOGGER.info("Missing effects: %d", len(missing))
     LOGGER.info("-----------------------------------")
 
 
 if __name__ == "__main__":
-
     try:
         main()
-
     except Exception:
-        logging.exception(
-            "Sound design failed."
-        )
+        logging.exception("Sound design failed.")
         raise
