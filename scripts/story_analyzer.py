@@ -1,7 +1,12 @@
 
 import json
+import os
 import re
 import time
+import random
+import urllib.request
+import urllib.error
+
 from pathlib import Path
 
 from google import genai
@@ -17,9 +22,11 @@ from scripts.utils import (
 )
 
 
-def build_analysis_prompt(story):
-    """Create instructions for cinematic horror story analysis."""
+# ---------------------------------------------------------
+# STORY ANALYSIS PROMPT
+# ---------------------------------------------------------
 
+def build_analysis_prompt(story):
     return f"""
 You are an expert Hindi horror film director, screenplay analyst,
 storyboard artist and cinematic visual designer.
@@ -110,8 +117,13 @@ COMPLETE ORIGINAL STORY:
 """
 
 
+# ---------------------------------------------------------
+# JSON EXTRACTION AND VALIDATION
+# ---------------------------------------------------------
+
 def extract_json(text):
-    """Extract JSON if the model adds extra text."""
+    if not text:
+        raise ValueError("AI returned an empty response.")
 
     text = text.strip()
 
@@ -128,31 +140,104 @@ def extract_json(text):
     end = text.rfind("}")
 
     if start == -1 or end == -1:
-        raise ValueError("Gemini did not return valid JSON.")
+        raise ValueError("AI did not return valid JSON.")
 
     return json.loads(text[start:end + 1])
 
 
-def analyze_story():
-    """Analyze the story using the Gemini API."""
+def validate_analysis(analysis):
+    if not isinstance(analysis, dict):
+        raise ValueError("Analysis must be a JSON object.")
 
-    config = load_config()
-    story = read_story()
-    api_key = get_api_key()
+    if not isinstance(analysis.get("scenes"), list):
+        raise ValueError("Analysis does not contain a valid scenes list.")
 
-    model_name = config["generation"]["text_model"]
-    max_retries = config["generation"].get("max_retries", 3)
-    retry_delay = config["generation"].get(
-        "retry_delay_seconds", 5
+    if len(analysis["scenes"]) == 0:
+        raise ValueError("Analysis contains zero scenes.")
+
+    for index, scene in enumerate(analysis["scenes"], start=1):
+        if not isinstance(scene, dict):
+            raise ValueError(
+                f"Scene {index} is not a valid JSON object."
+            )
+
+    analysis["total_scenes"] = len(analysis["scenes"])
+
+    return analysis
+
+
+# ---------------------------------------------------------
+# RETRY CONFIGURATION
+# ---------------------------------------------------------
+
+def get_error_status(error):
+    status = getattr(error, "code", None)
+
+    if status is None:
+        status = getattr(error, "status_code", None)
+
+    if status is None:
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_retryable_error(error):
+    status = get_error_status(error)
+
+    # Temporary server, rate-limit and network errors.
+    if status in (408, 409, 425, 429, 500, 502, 503, 504):
+        return True
+
+    # Permanent authentication, permission or model errors.
+    if status in (400, 401, 403, 404):
+        return False
+
+    # Invalid JSON / empty AI response can be retried.
+    if isinstance(error, (ValueError, json.JSONDecodeError)):
+        return True
+
+    # Network errors without an HTTP status can be temporary.
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True
+
+    return status is None
+
+
+def wait_before_retry(attempt, base_delay):
+    # Exponential backoff with small random jitter.
+    delay = min(base_delay * (2 ** (attempt - 1)), 60)
+    delay += random.uniform(0, 2)
+
+    logger.warning(
+        "Retrying after %.1f seconds...",
+        delay
     )
 
+    time.sleep(delay)
+
+
+# ---------------------------------------------------------
+# GEMINI PROVIDER
+# ---------------------------------------------------------
+
+def generate_with_gemini(
+    prompt,
+    api_key,
+    model_name,
+    max_retries,
+    retry_delay
+):
     client = genai.Client(api_key=api_key)
-    prompt = build_analysis_prompt(story)
 
     for attempt in range(1, max_retries + 1):
         try:
             logger.info(
-                "Starting story analysis. Attempt %s/%s",
+                "Gemini story analysis attempt %s/%s",
                 attempt,
                 max_retries
             )
@@ -170,35 +255,292 @@ def analyze_story():
                 raise ValueError("Gemini returned an empty response.")
 
             analysis = extract_json(response.text)
-
-            if not isinstance(analysis, dict):
-                raise ValueError("Analysis output must be a JSON object.")
-
-            if not analysis.get("scenes"):
-                raise ValueError("No scenes found in analysis.")
-
-            analysis["total_scenes"] = len(analysis["scenes"])
-
-            output_path = PROJECT_ROOT / "output" / "story_analysis.json"
-
-            save_json(analysis, output_path)
+            analysis = validate_analysis(analysis)
 
             logger.info(
-                "Story analysis completed. Total scenes: %s",
+                "Gemini analysis successful. Scenes: %s",
                 analysis["total_scenes"]
             )
 
             return analysis
 
         except Exception as error:
-            logger.exception("Story analysis attempt failed: %s", error)
+            logger.exception(
+                "Gemini attempt %s failed: %s",
+                attempt,
+                error
+            )
 
-            if attempt == max_retries:
+            if attempt >= max_retries:
+                break
+
+            if not is_retryable_error(error):
+                logger.warning(
+                    "Gemini error is not retryable. Switching provider."
+                )
+                break
+
+            wait_before_retry(attempt, retry_delay)
+
+    raise RuntimeError(
+        "Gemini failed after retries. OpenRouter fallback required."
+    )
+
+
+# ---------------------------------------------------------
+# OPENROUTER PROVIDER
+# ---------------------------------------------------------
+
+def generate_with_openrouter(
+    prompt,
+    api_key,
+    model_name,
+    max_retries,
+    retry_delay
+):
+    if not api_key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is missing. "
+            "Add it in GitHub Repository Secrets."
+        )
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(
+                "OpenRouter fallback attempt %s/%s using %s",
+                attempt,
+                max_retries,
+                model_name
+            )
+
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an expert Hindi horror film "
+                            "director and screenplay analyst. "
+                            "Follow the user's instructions exactly. "
+                            "Return only valid JSON."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "temperature": 0.4,
+                "response_format": {
+                    "type": "json_object"
+                }
+            }
+
+            request_data = json.dumps(payload).encode("utf-8")
+
+            request = urllib.request.Request(
+                url,
+                data=request_data,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/",
+                    "X-Title": "Horror Story Automation"
+                },
+                method="POST"
+            )
+
+            with urllib.request.urlopen(
+                request,
+                timeout=180
+            ) as response:
+                response_body = response.read().decode("utf-8")
+
+            result = json.loads(response_body)
+
+            choices = result.get("choices", [])
+
+            if not choices:
+                raise ValueError(
+                    "OpenRouter returned no choices."
+                )
+
+            message = choices[0].get("message", {})
+            content = message.get("content")
+
+            if isinstance(content, list):
+                content = "".join(
+                    item.get("text", "")
+                    for item in content
+                    if isinstance(item, dict)
+                )
+
+            if not content:
+                raise ValueError(
+                    "OpenRouter returned empty content."
+                )
+
+            analysis = extract_json(content)
+            analysis = validate_analysis(analysis)
+
+            logger.info(
+                "OpenRouter analysis successful. Scenes: %s",
+                analysis["total_scenes"]
+            )
+
+            return analysis
+
+        except urllib.error.HTTPError as error:
+            status = error.code
+            details = error.read().decode(
+                "utf-8",
+                errors="replace"
+            )
+
+            logger.error(
+                "OpenRouter HTTP error %s: %s",
+                status,
+                details[:1500]
+            )
+
+            if status in (400, 401, 403, 404):
+                raise RuntimeError(
+                    f"OpenRouter rejected the request (HTTP {status}). "
+                    "Check the API key and configured model."
+                ) from error
+
+            if attempt >= max_retries:
                 raise
 
-            time.sleep(retry_delay * attempt)
+            wait_before_retry(attempt, retry_delay)
 
-    raise RuntimeError("Story analysis failed.")
+        except Exception as error:
+            logger.exception(
+                "OpenRouter attempt %s failed: %s",
+                attempt,
+                error
+            )
+
+            if attempt >= max_retries:
+                raise
+
+            if not is_retryable_error(error):
+                raise
+
+            wait_before_retry(attempt, retry_delay)
+
+    raise RuntimeError("OpenRouter failed after all retries.")
+
+
+# ---------------------------------------------------------
+# SAVE ANALYSIS
+# ---------------------------------------------------------
+
+def save_analysis(analysis):
+    output_path = PROJECT_ROOT / "output" / "story_analysis.json"
+
+    save_json(analysis, output_path)
+
+    logger.info(
+        "Story analysis saved successfully: %s",
+        output_path
+    )
+
+    return analysis
+
+
+# ---------------------------------------------------------
+# MAIN ANALYSIS PIPELINE
+# ---------------------------------------------------------
+
+def analyze_story():
+    config = load_config()
+    story = read_story()
+
+    if not story or not story.strip():
+        raise ValueError("Story file is empty.")
+
+    generation_config = config["generation"]
+
+    model_name = generation_config["text_model"]
+
+    max_retries = max(
+        1,
+        int(generation_config.get("max_retries", 3))
+    )
+
+    retry_delay = max(
+        1,
+        int(generation_config.get("retry_delay_seconds", 5))
+    )
+
+    openrouter_model = (
+        generation_config.get("openrouter_text_model")
+        or os.getenv(
+            "OPENROUTER_MODEL",
+            "openai/gpt-4o-mini"
+        )
+    )
+
+    gemini_api_key = get_api_key()
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+
+    prompt = build_analysis_prompt(story)
+
+    logger.info("Starting story analysis.")
+    logger.info("Primary provider: Gemini")
+    logger.info("Fallback provider: OpenRouter")
+
+    # First attempt: Gemini.
+    try:
+        analysis = generate_with_gemini(
+            prompt=prompt,
+            api_key=gemini_api_key,
+            model_name=model_name,
+            max_retries=max_retries,
+            retry_delay=retry_delay
+        )
+
+        analysis["ai_provider"] = "Gemini"
+        analysis["ai_model"] = model_name
+
+        return save_analysis(analysis)
+
+    except Exception as gemini_error:
+        logger.error(
+            "Gemini unavailable. Activating OpenRouter fallback. "
+            "Reason: %s",
+            gemini_error
+        )
+
+    # Second attempt: OpenRouter automatic fallback.
+    try:
+        analysis = generate_with_openrouter(
+            prompt=prompt,
+            api_key=openrouter_api_key,
+            model_name=openrouter_model,
+            max_retries=max_retries,
+            retry_delay=retry_delay
+        )
+
+        analysis["ai_provider"] = "OpenRouter"
+        analysis["ai_model"] = openrouter_model
+
+        return save_analysis(analysis)
+
+    except Exception as openrouter_error:
+        logger.exception(
+            "Both Gemini and OpenRouter failed."
+        )
+
+        raise RuntimeError(
+            "Story analysis failed on both AI providers. "
+            f"Gemini model: {model_name}. "
+            f"OpenRouter model: {openrouter_model}. "
+            f"OpenRouter error: {openrouter_error}"
+        ) from openrouter_error
 
 
 if __name__ == "__main__":
