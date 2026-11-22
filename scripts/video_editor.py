@@ -7,14 +7,16 @@ Features:
 - Preserves chronological scene order.
 - Matches total video frames to narration duration.
 - Produces 1920x1080, 24 FPS MP4.
+- Burns Hindi subtitles into the video when enabled.
 - Verifies the final video using ffprobe.
+- Saves a detailed video production report.
 """
 
 import json
 import math
-import re
 import shutil
 import subprocess
+
 from pathlib import Path
 
 
@@ -23,11 +25,14 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 IMAGE_DIR = OUTPUT_DIR / "images"
 AUDIO_DIR = OUTPUT_DIR / "audio"
+SUBTITLE_DIR = OUTPUT_DIR / "subtitles"
 
 TEMP_DIR = OUTPUT_DIR / "temp_video"
 
+CONFIG_FILE = BASE_DIR / "config" / "config.json"
 ANALYSIS_FILE = OUTPUT_DIR / "story_analysis.json"
 IMAGE_REPORT_FILE = OUTPUT_DIR / "image_generation_report.json"
+SUBTITLE_FILE = SUBTITLE_DIR / "narration.srt"
 
 FINAL_VIDEO = OUTPUT_DIR / "final_video.mp4"
 VIDEO_REPORT = OUTPUT_DIR / "video_report.json"
@@ -40,6 +45,8 @@ DURATION_TOLERANCE = 0.15
 
 
 def run_command(command, cwd=None):
+    """Run an external command and report errors."""
+
     result = subprocess.run(
         command,
         stdout=subprocess.PIPE,
@@ -58,6 +65,8 @@ def run_command(command, cwd=None):
 
 
 def find_ffmpeg():
+    """Check FFmpeg and FFprobe availability."""
+
     for executable in ("ffmpeg", "ffprobe"):
         try:
             subprocess.run(
@@ -73,6 +82,8 @@ def find_ffmpeg():
 
 
 def load_json(path):
+    """Load and validate a JSON object."""
+
     if not path.exists():
         raise FileNotFoundError(
             f"Required file not found: {path}"
@@ -89,7 +100,22 @@ def load_json(path):
     return data
 
 
+def should_burn_subtitles():
+    """Check subtitle settings from config.json."""
+
+    config = load_json(CONFIG_FILE)
+
+    subtitle_settings = config.get("subtitles", {})
+
+    enabled = subtitle_settings.get("enabled", False)
+    burn = subtitle_settings.get("burn_into_video", False)
+
+    return bool(enabled and burn)
+
+
 def find_audio():
+    """Find the best available final narration audio."""
+
     candidates = [
         AUDIO_DIR / "final_audio.wav",
         AUDIO_DIR / "narration.wav",
@@ -108,6 +134,8 @@ def find_audio():
 
 
 def get_audio_duration(audio_path):
+    """Read actual audio duration using FFprobe."""
+
     result = run_command([
         "ffprobe",
         "-v", "error",
@@ -134,7 +162,7 @@ def get_audio_duration(audio_path):
 def get_current_run_images():
     """
     Read successful image paths from the current image report.
-    This prevents old images in other folders from being included.
+    Old images from other folders are not included.
     """
 
     report = load_json(IMAGE_REPORT_FILE)
@@ -168,7 +196,6 @@ def get_current_run_images():
 
         image_path = image_path.resolve()
 
-        # Only allow scene images from output/images.
         try:
             image_path.relative_to(IMAGE_DIR.resolve())
         except ValueError:
@@ -200,8 +227,8 @@ def get_current_run_images():
 
 def get_scene_weights(images, analysis):
     """
-    Use original storyboard event descriptions to distribute
-    visual time. These descriptions are not voiceover.
+    Use storyboard event descriptions to distribute visual time.
+    These descriptions are not used as voiceover.
     """
 
     scenes = analysis.get("scenes", [])
@@ -246,12 +273,14 @@ def get_scene_weights(images, analysis):
 
 def allocate_frames(weights, total_frames):
     """
-    Allocate integer frame counts while ensuring the sum
-    is exactly equal to total_frames.
+    Allocate integer frame counts.
+    The sum of all scene frames must equal total_frames.
     """
 
     if not weights:
-        raise ValueError("Cannot allocate frames without images.")
+        raise ValueError(
+            "Cannot allocate frames without images."
+        )
 
     if total_frames < len(weights):
         raise ValueError(
@@ -307,10 +336,7 @@ def create_scene_clip(
     output_path,
     index,
 ):
-    """
-    Create one cinematic still-image clip.
-    Every clip uses the same resolution and FPS.
-    """
+    """Create one cinematic still-image video clip."""
 
     if index % 2 == 0:
         zoom = "min(zoom+0.0005,1.08)"
@@ -352,7 +378,78 @@ def create_scene_clip(
     ])
 
 
+def escape_subtitle_path(path):
+    """
+    Escape a subtitle path for FFmpeg's subtitles filter.
+    """
+
+    value = str(path.resolve())
+
+    value = value.replace("\\", "\\\\")
+    value = value.replace(":", "\\:")
+    value = value.replace("'", "\\'")
+
+    return value
+
+
+def burn_subtitles(input_video, output_video):
+    """Burn Hindi SRT subtitles into the silent video."""
+
+    if not SUBTITLE_FILE.is_file():
+        raise FileNotFoundError(
+            "Subtitle file missing: "
+            "output/subtitles/narration.srt"
+        )
+
+    if SUBTITLE_FILE.stat().st_size == 0:
+        raise ValueError(
+            "Subtitle file is empty."
+        )
+
+    subtitle_path = escape_subtitle_path(
+        SUBTITLE_FILE
+    )
+
+    subtitle_filter = (
+        f"subtitles='{subtitle_path}':"
+        "force_style='FontName=Noto Sans Devanagari,"
+        "FontSize=24,"
+        "PrimaryColour=&H00FFFFFF,"
+        "OutlineColour=&H00000000,"
+        "BorderStyle=1,"
+        "Outline=2,"
+        "Shadow=1,"
+        "Alignment=2,"
+        "MarginV=45'"
+    )
+
+    print("Burning Hindi subtitles into video...")
+
+    run_command([
+        "ffmpeg",
+        "-y",
+        "-i", str(input_video),
+        "-vf", subtitle_filter,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-r", str(FPS),
+        "-an",
+        str(output_video),
+    ])
+
+    if not output_video.is_file() or output_video.stat().st_size == 0:
+        raise RuntimeError(
+            "Subtitle-burned video was not created."
+        )
+
+    return output_video
+
+
 def get_video_info(video_path):
+    """Read final MP4 metadata using FFprobe."""
+
     result = run_command([
         "ffprobe",
         "-v", "error",
@@ -413,6 +510,8 @@ def get_video_info(video_path):
 
 
 def create_video():
+    """Run the complete cinematic video editing process."""
+
     OUTPUT_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -420,14 +519,14 @@ def create_video():
 
     find_ffmpeg()
 
-    # Load current run's analysis and image report.
     analysis = load_json(ANALYSIS_FILE)
     images = get_current_run_images()
 
     audio_path = find_audio()
     audio_duration = get_audio_duration(audio_path)
 
-    # Use nearest whole video frame to match narration duration.
+    burn_subtitles_enabled = should_burn_subtitles()
+
     total_frames = round(
         audio_duration * FPS
     )
@@ -458,9 +557,9 @@ def create_video():
     print(f"Target video duration: {target_video_duration:.3f} seconds")
     print(f"Resolution: {WIDTH}x{HEIGHT}")
     print(f"FPS: {FPS}")
+    print(f"Burn subtitles: {burn_subtitles_enabled}")
     print("--------------------------------------")
 
-    # Clean temporary clips from previous runs.
     if TEMP_DIR.exists():
         shutil.rmtree(TEMP_DIR)
 
@@ -486,8 +585,7 @@ def create_video():
 
         print(
             f"Rendering scene {index}/{len(images)} "
-            f"| {duration:.2f}s | "
-            f"{frames} frames"
+            f"| {duration:.2f}s | {frames} frames"
         )
 
         create_scene_clip(
@@ -499,7 +597,6 @@ def create_video():
 
         clip_paths.append(clip_path)
 
-    # Create a simple concat list in the temp directory.
     concat_file = TEMP_DIR / "concat_list.txt"
 
     with open(
@@ -525,6 +622,16 @@ def create_video():
         str(silent_video),
     ], cwd=TEMP_DIR)
 
+    video_for_audio = silent_video
+
+    if burn_subtitles_enabled:
+        captioned_video = TEMP_DIR / "captioned_video.mp4"
+
+        video_for_audio = burn_subtitles(
+            silent_video,
+            captioned_video,
+        )
+
     print(
         "Combining video with narration and sound design..."
     )
@@ -532,7 +639,7 @@ def create_video():
     run_command([
         "ffmpeg",
         "-y",
-        "-i", str(silent_video),
+        "-i", str(video_for_audio),
         "-i", str(audio_path),
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -550,7 +657,6 @@ def create_video():
             "Final video was not created correctly."
         )
 
-    # Verify actual MP4 metadata and duration.
     video_info = get_video_info(FINAL_VIDEO)
 
     if (
@@ -602,6 +708,12 @@ def create_video():
             3,
         ),
         "total_video_frames": total_frames,
+        "subtitles_enabled": burn_subtitles_enabled,
+        "subtitle_file": (
+            str(SUBTITLE_FILE.relative_to(BASE_DIR))
+            if burn_subtitles_enabled
+            else None
+        ),
         "status": "completed",
     }
 
@@ -624,6 +736,9 @@ def create_video():
     )
     print(
         f"Audio/video difference: {duration_difference:.3f} seconds"
+    )
+    print(
+        f"Hindi subtitles burned: {burn_subtitles_enabled}"
     )
 
     return FINAL_VIDEO
