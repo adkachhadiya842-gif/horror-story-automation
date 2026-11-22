@@ -1,10 +1,10 @@
 
 """
 Hindi Horror Story Automation
-Reliable Gemini 3.8 Flash TTS Generator
+Reliable Gemini TTS Generator
 
 The original input/story.txt is the ONLY narration source.
-Scene summaries are never used as voiceover.
+Scene summaries are never used for voiceover.
 """
 
 import base64
@@ -73,7 +73,7 @@ LOGGER = logging.getLogger("horror_voice_generator")
 
 
 def clean_narration(text):
-    """Remove Markdown formatting without rewriting story content."""
+    """Remove Markdown formatting without changing story wording."""
 
     if not isinstance(text, str):
         raise ValueError("Story narration must be text.")
@@ -90,14 +90,15 @@ def clean_narration(text):
     text = text.replace("__", "")
     text = text.replace("*", "")
 
-    return text.strip()
+    # Use one consistent whitespace format throughout the pipeline.
+    # This prevents newline and multiple-space count mismatches.
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
 
 
 def normalize_for_comparison(text):
-    """Normalize whitespace and Markdown for source comparison."""
-
-    text = clean_narration(text)
-    return re.sub(r"\s+", " ", text).strip()
+    return clean_narration(text)
 
 
 def load_story_analysis():
@@ -190,7 +191,7 @@ def get_voice_config(config):
 
 def extract_original_narration(analysis):
     """
-    Read the original story directly.
+    Original input/story.txt is the only narration source.
     Analysis JSON is used only for comparison and metadata.
     """
 
@@ -207,15 +208,11 @@ def extract_original_narration(analysis):
 
     if isinstance(analyzed_story, str) and analyzed_story.strip():
 
-        original_normalized = normalize_for_comparison(
-            narration
-        )
-
         analyzed_normalized = normalize_for_comparison(
             analyzed_story
         )
 
-        if original_normalized != analyzed_normalized:
+        if analyzed_normalized != narration:
             LOGGER.warning(
                 "Analysis narration differs from input/story.txt. "
                 "The original input story will be used."
@@ -245,42 +242,55 @@ def save_narration_text(text):
 
 def split_long_text(text, max_chars):
     """
-    Split at whitespace boundaries.
-    No words are dropped or rewritten.
+    Split narration at word boundaries.
+
+    Every chunk is reconstructed using exactly one space
+    between chunks. The reconstructed text must exactly
+    match the canonical narration.
     """
 
-    text = re.sub(r"\s+", " ", text).strip()
-
-    if not text:
+    if not isinstance(text, str) or not text.strip():
         raise ValueError("Narration is empty.")
 
-    chunks = []
-    remaining = text
-
-    while len(remaining) > max_chars:
-
-        split_position = remaining.rfind(
-            " ",
-            0,
-            max_chars + 1,
+    if re.sub(r"\s+", " ", text).strip() != text:
+        raise ValueError(
+            "Narration must be whitespace-normalized before splitting."
         )
 
-        if split_position < 1:
-            split_position = max_chars
+    if max_chars < 1:
+        raise ValueError("Invalid maximum chunk size.")
 
-        chunk = remaining[:split_position].strip()
+    words = text.split(" ")
 
-        if not chunk:
-            raise ValueError(
-                "Could not create a valid narration chunk."
-            )
+    chunks = []
+    current_words = []
+    current_length = 0
 
-        chunks.append(chunk)
+    for word in words:
 
-        remaining = remaining[split_position:].strip()
+        if not word:
+            continue
 
-    if remaining:
-        chunks.append(remaining)
+        additional_length = (
+            len(word)
+            if not current_words
+            else len(word) + 1
+        )
+
+        if (
+            current_words
+            and current_length + additional_length > max_chars
+        ):
+            chunks.append(" ".join(current_words))
+            current_words = [word]
+            current_length = len(word)
+
+        else:
+            current_words.append(word)
+            current_length += additional_length
+
+    if current_words:
+        chunks.append(" ".join(current_words))
 
     if not chunks:
         raise ValueError("No narration chunks were created.")
@@ -289,9 +299,14 @@ def split_long_text(text, max_chars):
 
     if reconstructed != text:
         raise ValueError(
-            "Chunk integrity check failed. "
-            "Narration text may have been lost."
+            "Chunk reconstruction failed. "
+            "Original narration was not preserved."
         )
+
+    LOGGER.info(
+        "Chunk integrity passed: %s characters reconstructed.",
+        len(reconstructed),
+    )
 
     return chunks
 
@@ -311,22 +326,28 @@ def create_client():
 
 
 def validate_wav(path, text_length):
-    """Validate WAV structure, duration and basic audio level."""
+    """Validate WAV structure, duration and audio format."""
 
-    with wave.open(str(path), "rb") as audio:
+    try:
+        with wave.open(str(path), "rb") as audio:
 
-        frames = audio.getnframes()
-        sample_rate = audio.getframerate()
-        channels = audio.getnchannels()
-        sample_width = audio.getsampwidth()
+            frames = audio.getnframes()
+            sample_rate = audio.getframerate()
+            channels = audio.getnchannels()
+            sample_width = audio.getsampwidth()
 
-        if frames <= 0 or sample_rate <= 0:
-            raise ValueError("Generated WAV is empty.")
+            if frames <= 0 or sample_rate <= 0:
+                raise ValueError("Generated WAV is empty.")
 
-        if channels < 1 or sample_width < 1:
-            raise ValueError("Invalid WAV audio format.")
+            if channels < 1 or sample_width < 1:
+                raise ValueError("Invalid WAV audio format.")
 
-        duration = frames / sample_rate
+            duration = frames / sample_rate
+
+    except (wave.Error, EOFError) as error:
+        raise ValueError(
+            f"Invalid or corrupted WAV file: {error}"
+        ) from error
 
     minimum_duration = (
         text_length * MIN_EXPECTED_AUDIO_SECONDS_PER_CHARACTER
@@ -411,10 +432,13 @@ def generate_audio_chunk(
                     "Gemini returned empty audio data."
                 )
 
-            audio_bytes = base64.b64decode(
-                audio_data,
-                validate=True,
-            )
+            if isinstance(audio_data, str):
+                audio_bytes = base64.b64decode(
+                    audio_data,
+                    validate=True,
+                )
+            else:
+                audio_bytes = bytes(audio_data)
 
             if not audio_bytes.startswith(b"RIFF"):
                 raise RuntimeError(
@@ -470,7 +494,7 @@ def generate_audio_chunk(
 
 
 def combine_audio_chunks(chunk_paths, output_path):
-    """Combine WAV files without changing sample format."""
+    """Combine WAV files without changing their sample format."""
 
     if not chunk_paths:
         raise ValueError("No audio chunks to combine.")
@@ -558,8 +582,10 @@ def main():
     analysis = load_story_analysis()
     settings = get_voice_config(config)
 
+    # Read and normalize the original story exactly once.
     narration = extract_original_narration(analysis)
 
+    # This exact text is used for both saving and TTS generation.
     save_narration_text(narration)
 
     chunks = split_long_text(
@@ -577,7 +603,7 @@ def main():
         len(chunks),
     )
 
-    # Remove old generated chunks and audio.
+    # Remove old chunks and old final output before a fresh run.
     CHUNKS_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -621,17 +647,44 @@ def main():
             "Not all narration chunks were generated."
         )
 
-    generated_characters = sum(
-        item["characters"]
-        for item in generated_chunks
-    )
+    # Verify every generated chunk against its source chunk.
+    for index, (result, source_chunk) in enumerate(
+        zip(generated_chunks, chunks),
+        start=1,
+    ):
+
+        if result["characters"] != len(source_chunk):
+            raise RuntimeError(
+                f"Chunk {index} character count mismatch."
+            )
+
+        if result["status"] != "success":
+            raise RuntimeError(
+                f"Chunk {index} was not generated successfully."
+            )
+
+        if not Path(result["path"]).exists():
+            raise RuntimeError(
+                f"Chunk {index} audio file is missing."
+            )
+
+    # Include spaces between chunks in the total character count.
+    reconstructed_narration = " ".join(chunks)
+
+    generated_characters = len(reconstructed_narration)
+
+    if reconstructed_narration != narration:
+        raise RuntimeError(
+            "Generated chunk text does not match original narration."
+        )
 
     if generated_characters != len(narration):
         raise RuntimeError(
-            "Generated chunk character count does not "
-            "match original narration."
+            "Generated narration character count does not match "
+            "the original narration."
         )
 
+    # Combine all successfully generated audio chunks.
     total_duration = combine_audio_chunks(
         chunk_paths,
         FINAL_AUDIO,
@@ -647,6 +700,11 @@ def main():
             "Final audio duration verification failed."
         )
 
+    chunk_character_sum = sum(
+        item["characters"]
+        for item in generated_chunks
+    )
+
     report = {
         "story_title": analysis.get(
             "title",
@@ -658,6 +716,10 @@ def main():
         "narration_source": "input/story.txt",
         "narration_characters": len(narration),
         "generated_characters": generated_characters,
+        "chunk_character_sum_without_separators": (
+            chunk_character_sum
+        ),
+        "inter_chunk_spaces": max(0, len(chunks) - 1),
         "total_chunks": len(generated_chunks),
         "total_duration_seconds": final_duration,
         "average_characters_per_second": round(
@@ -678,6 +740,7 @@ def main():
     LOGGER.info("Generated characters: %s", generated_characters)
     LOGGER.info("Total chunks: %s", len(generated_chunks))
     LOGGER.info("Final audio: %.2f seconds", final_duration)
+    LOGGER.info("Final audio file: %s", FINAL_AUDIO)
     LOGGER.info("------------------------------------")
 
 
