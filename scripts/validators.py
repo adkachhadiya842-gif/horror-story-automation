@@ -1,34 +1,36 @@
 
+import os
+
 from scripts.utils import (
     logger,
     get_api_key,
     get_story_path,
     load_config,
-    read_story
+    read_story,
 )
 
 
 def validate_story():
-    """Check that the input story exists and is not empty."""
+    """Check that the input story exists and is valid."""
 
     story_path = get_story_path()
     story = read_story()
 
-    if len(story) < 100:
+    if len(story.strip()) < 100:
         raise ValueError(
             "Story is too short. Please provide a complete story."
         )
 
     logger.info(
         "Story validation passed: %s characters",
-        len(story)
+        len(story),
     )
 
     return story_path
 
 
 def validate_config(config):
-    """Validate required video and generation settings."""
+    """Validate project configuration."""
 
     required_sections = [
         "project",
@@ -38,40 +40,62 @@ def validate_config(config):
         "audio",
         "subtitles",
         "thumbnail",
-        "generation"
+        "generation",
     ]
 
     for section in required_sections:
-        if section not in config:
+        if not isinstance(config.get(section), dict):
             raise ValueError(
-                f"Missing configuration section: {section}"
+                f"Missing or invalid configuration section: {section}"
             )
 
     video = config["video"]
 
-    if video.get("width", 0) <= 0:
-        raise ValueError("Video width must be positive.")
+    for key in ["width", "height", "fps", "image_count"]:
+        try:
+            value = int(video.get(key, 0))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid video setting: {key}"
+            )
 
-    if video.get("height", 0) <= 0:
-        raise ValueError("Video height must be positive.")
+        if value <= 0:
+            raise ValueError(
+                f"Video setting {key} must be positive."
+            )
 
-    if video.get("fps", 0) <= 0:
-        raise ValueError("Video FPS must be positive.")
-
-    image_count = video.get("image_count", 0)
-
-    if image_count not in [72, 96, 120]:
+    if video["width"] != 1920 or video["height"] != 1080:
         raise ValueError(
-            "Image count must be 72, 96, or 120."
+            "This production pipeline currently requires "
+            "1920x1080 video resolution."
+        )
+
+    if video["fps"] != 24:
+        raise ValueError(
+            "This production pipeline currently requires 24 FPS."
+        )
+
+    if video["image_count"] > 96:
+        raise ValueError(
+            "Maximum configured scene image count is 96."
         )
 
     generation = config["generation"]
 
     if not generation.get("text_model"):
-        raise ValueError("Text model is not configured.")
+        raise ValueError(
+            "Text model is not configured."
+        )
 
-    if not generation.get("image_model"):
-        raise ValueError("Image model is not configured.")
+    if not generation.get("openrouter_text_model"):
+        raise ValueError(
+            "OpenRouter text fallback model is not configured."
+        )
+
+    if not config["images"].get("aspect_ratio"):
+        raise ValueError(
+            "Image aspect ratio is not configured."
+        )
 
     logger.info("Configuration validation passed.")
 
@@ -79,14 +103,43 @@ def validate_config(config):
 
 
 def validate_api_key():
-    """Check whether Gemini API key is available."""
+    """Validate credentials for the configured providers."""
 
-    api_key = get_api_key()
+    gemini_key = os.getenv(
+        "GEMINI_API_KEY",
+        "",
+    ).strip()
 
-    if len(api_key) < 10:
-        raise ValueError("Gemini API key appears invalid.")
+    openrouter_key = os.getenv(
+        "OPENROUTER_API_KEY",
+        "",
+    ).strip()
 
-    logger.info("Gemini API key is available.")
+    if not gemini_key:
+        raise ValueError(
+            "GEMINI_API_KEY is missing. "
+            "Configure it in GitHub repository secrets."
+        )
+
+    if len(gemini_key) < 10:
+        raise ValueError(
+            "GEMINI_API_KEY appears invalid."
+        )
+
+    if not openrouter_key:
+        raise ValueError(
+            "OPENROUTER_API_KEY is missing. "
+            "It is required for image generation and text fallback."
+        )
+
+    if len(openrouter_key) < 10:
+        raise ValueError(
+            "OPENROUTER_API_KEY appears invalid."
+        )
+
+    logger.info(
+        "Gemini and OpenRouter credentials are available."
+    )
 
     return True
 
@@ -102,6 +155,8 @@ def run_all_validations():
     validate_config(config)
     validate_api_key()
 
-    logger.info("All validations passed successfully.")
+    logger.info(
+        "All project validations passed successfully."
+    )
 
     return config
