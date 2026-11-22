@@ -86,14 +86,41 @@ def setup_logging():
 LOGGER = logging.getLogger("horror_voice_generator")
 
 
+
 def clean_narration(text):
-    """Remove Markdown formatting without changing story wording."""
+    """
+    Remove template instructions and formatting.
+    Preserve actual story title, narration and dialogues.
+    """
 
     if not isinstance(text, str):
         raise ValueError("Story narration must be text.")
 
-    text = text.strip()
+    # Remove template instruction.
+    text = re.sub(
+        r"(?im)^\s*YAHAN APNI COMPLETE HORROR STORY PASTE KAREIN\.?\s*$",
+        "",
+        text,
+    )
 
+    # Remove labels, but preserve the actual title and story.
+    text = re.sub(
+        r"(?im)^\s*Story\s+Title\s*:\s*",
+        "",
+        text,
+    )
+
+    text = re.sub(
+        r"(?im)^\s*Story\s*:\s*",
+        "",
+        text,
+    )
+
+    # Remove square brackets used as template wrappers.
+    text = text.replace("[", "")
+    text = text.replace("]", "")
+
+    # Remove Markdown heading and emphasis formatting.
     text = re.sub(
         r"(?m)^\s*#{1,6}\s*",
         "",
@@ -104,9 +131,11 @@ def clean_narration(text):
     text = text.replace("__", "")
     text = text.replace("*", "")
 
+    # Normalize whitespace without changing story wording.
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
+
 
 
 def normalize_for_comparison(text):
