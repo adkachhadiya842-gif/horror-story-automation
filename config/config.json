@@ -51,9 +51,10 @@
     "width": 1280,
     "height": 720
   },
- "generation": {
+  "generation": {
   "image_model": "gemini-2.5-flash-image",
   "text_model": "gemini-3.8-flash",
+  "openrouter_text_model": "openai/gpt-4o-mini",
   "max_retries": 3,
   "retry_delay_seconds": 5
 }
