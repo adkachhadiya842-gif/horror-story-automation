@@ -325,15 +325,22 @@ def split_long_text(text, max_chars):
     return chunks
 
 
+
 def create_client():
-    """Initialize Google Gen AI client."""
+    """Initialize Google Gen AI client using v1beta API."""
 
     api_key = get_api_key()
 
     if not api_key:
         raise ValueError("GEMINI_API_KEY is missing.")
 
-    return genai.Client(api_key=api_key)
+    return genai.Client(
+        api_key=api_key,
+        http_options={
+            "api_version": "v1beta"
+        }
+    )
+
 
 
 def generate_audio_chunk(
