@@ -1,7 +1,7 @@
 
 """
 Hindi Horror Story Automation
-Reliable Gemini TTS Generator
+Optimized and Reliable Gemini TTS Generator
 
 The original input/story.txt is the ONLY narration source.
 Scene summaries are never used for voiceover.
@@ -51,6 +51,14 @@ DEFAULT_STYLE = (
 MIN_NARRATION_CHARACTERS = 300
 MIN_EXPECTED_AUDIO_SECONDS_PER_CHARACTER = 1 / 35
 
+# Optimized defaults
+DEFAULT_CHUNK_SIZE = 2500
+MAX_CHUNK_SIZE = 4000
+
+# Retry limits
+MAX_BACKOFF_SECONDS = 180
+RATE_LIMIT_BASE_WAIT = 30
+
 
 def setup_logging():
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
@@ -90,8 +98,6 @@ def clean_narration(text):
     text = text.replace("__", "")
     text = text.replace("*", "")
 
-    # Use one consistent whitespace format throughout the pipeline.
-    # This prevents newline and multiple-space count mismatches.
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
@@ -163,12 +169,16 @@ def get_voice_config(config):
     )
 
     chunk_size = int(
-        voice_settings.get("chunk_size", 1200)
+        voice_settings.get(
+            "chunk_size",
+            DEFAULT_CHUNK_SIZE,
+        )
     )
 
-    if not 300 <= chunk_size <= 4000:
+    if not 500 <= chunk_size <= MAX_CHUNK_SIZE:
         raise ValueError(
-            "TTS chunk_size must be between 300 and 4000."
+            f"TTS chunk_size must be between 500 and "
+            f"{MAX_CHUNK_SIZE}."
         )
 
     max_retries = int(
@@ -184,7 +194,7 @@ def get_voice_config(config):
         "voice": voice,
         "style": style,
         "chunk_size": chunk_size,
-        "max_retries": max(1, min(max_retries, 5)),
+        "max_retries": max(1, min(max_retries, 4)),
         "retry_delay": max(1, retry_delay),
     }
 
@@ -241,13 +251,7 @@ def save_narration_text(text):
 
 
 def split_long_text(text, max_chars):
-    """
-    Split narration at word boundaries.
-
-    Every chunk is reconstructed using exactly one space
-    between chunks. The reconstructed text must exactly
-    match the canonical narration.
-    """
+    """Split narration at word boundaries without losing text."""
 
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Narration is empty.")
@@ -308,6 +312,13 @@ def split_long_text(text, max_chars):
         len(reconstructed),
     )
 
+    for index, chunk in enumerate(chunks, start=1):
+        LOGGER.info(
+            "Chunk plan %s: %s characters",
+            index,
+            len(chunk),
+        )
+
     return chunks
 
 
@@ -364,6 +375,140 @@ def validate_wav(path, text_length):
     return round(duration, 2)
 
 
+def get_error_status(error):
+    """Extract HTTP/API status from different SDK error formats."""
+
+    for attribute in ("status_code", "status", "code"):
+
+        value = getattr(error, attribute, None)
+
+        if value is None:
+            continue
+
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            pass
+
+    message = str(error)
+
+    match = re.search(
+        r"\b(408|429|500|502|503|504)\b",
+        message,
+    )
+
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+def is_permanent_quota_error(error):
+    """Detect quota exhaustion that retries cannot fix."""
+
+    message = str(error).lower()
+
+    permanent_phrases = (
+        "per day",
+        "per-day",
+        "daily limit",
+        "daily quota",
+        "quota exceeded for quota metric",
+        "limit: 0",
+        "billing",
+        "insufficient quota",
+    )
+
+    return any(
+        phrase in message
+        for phrase in permanent_phrases
+    )
+
+
+def is_retryable_error(error):
+    """Only retry temporary service and rate-limit errors."""
+
+    status = get_error_status(error)
+
+    if status in (408, 429, 500, 502, 503, 504):
+        return True
+
+    message = str(error).lower()
+
+    temporary_phrases = (
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection error",
+        "temporarily unavailable",
+        "service unavailable",
+        "resource exhausted",
+        "too many requests",
+    )
+
+    return any(
+        phrase in message
+        for phrase in temporary_phrases
+    )
+
+
+def get_retry_after(error):
+    """Read Retry-After header if the SDK exposes it."""
+
+    response = getattr(error, "response", None)
+
+    if response is None:
+        return None
+
+    headers = getattr(response, "headers", None)
+
+    if headers is None:
+        return None
+
+    try:
+        value = headers.get("retry-after")
+
+        if value is None:
+            return None
+
+        return max(1, int(float(value)))
+
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def calculate_retry_wait(error, attempt, settings):
+    """Calculate increasing wait time for temporary failures."""
+
+    status = get_error_status(error)
+
+    if status == 429:
+        base_wait = max(
+            RATE_LIMIT_BASE_WAIT,
+            settings["retry_delay"],
+        )
+    else:
+        base_wait = max(
+            10,
+            settings["retry_delay"],
+        )
+
+    wait_seconds = min(
+        base_wait * (2 ** (attempt - 1)),
+        MAX_BACKOFF_SECONDS,
+    )
+
+    retry_after = get_retry_after(error)
+
+    if retry_after is not None:
+        wait_seconds = max(
+            wait_seconds,
+            min(retry_after, MAX_BACKOFF_SECONDS),
+        )
+
+    return wait_seconds
+
+
 def generate_audio_chunk(
     client,
     text,
@@ -379,6 +524,10 @@ def generate_audio_chunk(
         1,
         settings["max_retries"] + 1,
     ):
+
+        temporary_path = output_path.with_name(
+            output_path.stem + ".temporary.wav"
+        )
 
         try:
             LOGGER.info(
@@ -450,12 +599,15 @@ def generate_audio_chunk(
                 exist_ok=True,
             )
 
-            output_path.write_bytes(audio_bytes)
+            temporary_path.write_bytes(audio_bytes)
 
             duration = validate_wav(
-                output_path,
+                temporary_path,
                 len(text),
             )
+
+            # Replace the final chunk only after validation.
+            temporary_path.replace(output_path)
 
             LOGGER.info(
                 "Chunk %s completed: %.2f seconds",
@@ -476,16 +628,47 @@ def generate_audio_chunk(
             last_error = error
 
             LOGGER.warning(
-                "Chunk %s failed: %s",
+                "Chunk %s failed on attempt %s: %s",
                 chunk_number,
+                attempt,
                 error,
             )
+
+            if temporary_path.exists():
+                temporary_path.unlink()
 
             if output_path.exists():
                 output_path.unlink()
 
+            if is_permanent_quota_error(error):
+                raise RuntimeError(
+                    "Gemini quota appears exhausted. "
+                    "Automatic retries will not fix a daily quota limit. "
+                    f"Original error: {error}"
+                ) from error
+
+            if not is_retryable_error(error):
+                raise RuntimeError(
+                    f"Non-retryable TTS error on chunk "
+                    f"{chunk_number}: {error}"
+                ) from error
+
             if attempt < settings["max_retries"]:
-                time.sleep(settings["retry_delay"])
+
+                wait_seconds = calculate_retry_wait(
+                    error,
+                    attempt,
+                    settings,
+                )
+
+                LOGGER.warning(
+                    "Temporary API failure. Waiting %s seconds "
+                    "before retrying chunk %s.",
+                    wait_seconds,
+                    chunk_number,
+                )
+
+                time.sleep(wait_seconds)
 
     raise RuntimeError(
         f"Chunk {chunk_number} failed after "
@@ -528,7 +711,11 @@ def combine_audio_chunks(chunk_paths, output_path):
         exist_ok=True,
     )
 
-    with wave.open(str(output_path), "wb") as output:
+    temporary_output = output_path.with_name(
+        output_path.stem + ".temporary.wav"
+    )
+
+    with wave.open(str(temporary_output), "wb") as output:
 
         output.setnchannels(reference_params.nchannels)
         output.setsampwidth(reference_params.sampwidth)
@@ -544,6 +731,8 @@ def combine_audio_chunks(chunk_paths, output_path):
                 output.writeframes(
                     audio.readframes(audio.getnframes())
                 )
+
+    temporary_output.replace(output_path)
 
     duration = total_frames / reference_params.framerate
 
@@ -582,10 +771,8 @@ def main():
     analysis = load_story_analysis()
     settings = get_voice_config(config)
 
-    # Read and normalize the original story exactly once.
     narration = extract_original_narration(analysis)
 
-    # This exact text is used for both saving and TTS generation.
     save_narration_text(narration)
 
     chunks = split_long_text(
@@ -603,7 +790,11 @@ def main():
         len(chunks),
     )
 
-    # Remove old chunks and old final output before a fresh run.
+    LOGGER.info(
+        "Configured chunk size: %s characters",
+        settings["chunk_size"],
+    )
+
     CHUNKS_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -647,7 +838,6 @@ def main():
             "Not all narration chunks were generated."
         )
 
-    # Verify every generated chunk against its source chunk.
     for index, (result, source_chunk) in enumerate(
         zip(generated_chunks, chunks),
         start=1,
@@ -668,7 +858,6 @@ def main():
                 f"Chunk {index} audio file is missing."
             )
 
-    # Include spaces between chunks in the total character count.
     reconstructed_narration = " ".join(chunks)
 
     generated_characters = len(reconstructed_narration)
@@ -684,7 +873,6 @@ def main():
             "the original narration."
         )
 
-    # Combine all successfully generated audio chunks.
     total_duration = combine_audio_chunks(
         chunk_paths,
         FINAL_AUDIO,
@@ -716,6 +904,7 @@ def main():
         "narration_source": "input/story.txt",
         "narration_characters": len(narration),
         "generated_characters": generated_characters,
+        "chunk_size": settings["chunk_size"],
         "chunk_character_sum_without_separators": (
             chunk_character_sum
         ),
