@@ -1,12 +1,21 @@
 
+"""
+Hindi Horror Story Automation
+Story Analyzer
+
+IMPORTANT:
+- Original story is preserved locally and verbatim.
+- AI is used ONLY for visual story analysis.
+- AI-generated scene summaries are NOT used as voiceover.
+"""
 
 import json
+import logging
 import os
 import re
 import time
-import random
-import urllib.request
 import urllib.error
+import urllib.request
 
 from pathlib import Path
 
@@ -14,535 +23,600 @@ from google import genai
 from google.genai import types
 
 from scripts.utils import (
-    PROJECT_ROOT,
-    logger,
-    get_api_key,
+    OUTPUT_DIR,
     load_config,
-    read_story,
-    save_json
+    get_api_key,
+    create_project_directories,
 )
 
 
-# ---------------------------------------------------------
-# STORY ANALYSIS PROMPT
-# ---------------------------------------------------------
+LOGGER = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+STORY_FILE = PROJECT_ROOT / "input" / "story.txt"
+
+OUTPUT_ROOT = Path(OUTPUT_DIR)
+ANALYSIS_FILE = OUTPUT_ROOT / "story_analysis.json"
+
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini"
+
+MIN_STORY_CHARACTERS = 300
+
+
+def setup_logging():
+    """Initialize logging."""
+
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(
+                OUTPUT_ROOT / "story_analyzer.log",
+                encoding="utf-8",
+            ),
+        ],
+        force=True,
+    )
+
+
+def read_story():
+    """Read the complete original story without rewriting it."""
+
+    if not STORY_FILE.exists():
+        raise FileNotFoundError(
+            f"Story file not found: {STORY_FILE}"
+        )
+
+    with open(STORY_FILE, "r", encoding="utf-8-sig") as file:
+        story = file.read()
+
+    if not story or not story.strip():
+        raise ValueError("input/story.txt is empty.")
+
+    if len(story.strip()) < MIN_STORY_CHARACTERS:
+        raise ValueError(
+            "Story is too short. Please check input/story.txt."
+        )
+
+    LOGGER.info(
+        "Original story loaded: %s characters",
+        len(story),
+    )
+
+    return story
+
+
+def get_generation_settings(config):
+    """Read text model settings from config."""
+
+    if not isinstance(config, dict):
+        config = {}
+
+    generation = config.get("generation", {})
+
+    if not isinstance(generation, dict):
+        generation = {}
+
+    gemini_model = (
+        generation.get("text_model")
+        or DEFAULT_GEMINI_MODEL
+    )
+
+    openrouter_model = (
+        generation.get("openrouter_text_model")
+        or DEFAULT_OPENROUTER_MODEL
+    )
+
+    max_retries = int(
+        generation.get("max_retries", 3)
+    )
+
+    retry_delay = int(
+        generation.get("retry_delay_seconds", 5)
+    )
+
+    return {
+        "gemini_model": gemini_model,
+        "openrouter_model": openrouter_model,
+        "max_retries": max(1, min(max_retries, 5)),
+        "retry_delay": max(1, retry_delay),
+    }
+
 
 def build_analysis_prompt(story):
+    """
+    Ask AI to analyze the story for visual production.
+
+    The original story itself is saved separately by Python.
+    AI must not rewrite the narration.
+    """
+
     return f"""
-You are an expert Hindi horror film director, screenplay analyst,
-storyboard artist and cinematic visual designer.
+You are a professional Hindi horror film director,
+screenwriter, storyboard artist and visual continuity supervisor.
 
-Analyze the complete story provided below.
+Analyze the COMPLETE original Hindi horror story below.
 
-STRICT RULES:
-1. Preserve the original plot and event sequence.
-2. Never change character names or relationships.
-3. Preserve important dialogues and story events.
-4. Never change the original ending.
-5. Do not invent new characters or subplots.
-6. Do not remove important suspense or horror moments.
-7. Keep all descriptions faithful to the original story.
-8. Write narration in natural, cinematic Hindi.
-9. Keep the original story's language and cultural context.
-10. Every scene must follow the original story order.
+YOUR TASK:
+Create a detailed visual production analysis in valid JSON.
+
+CRITICAL STORY RULES:
+1. Preserve every original character name.
+2. Preserve character relationships.
+3. Preserve the original story order.
+4. Do not remove important events.
+5. Do not invent new characters.
+6. Do not invent new locations or subplots.
+7. Do not change the ending.
+8. Do not change the meaning of any dialogue.
+9. Do not add events that are not in the original story.
+10. Do not rewrite or shorten the original story.
+11. Do not generate the final voiceover.
+12. Scene narration is ONLY a short visual reference, NOT voiceover.
+
+VISUAL SCENE BREAKDOWN:
+- Divide the complete story into sequential cinematic visual scenes.
+- Include every important event and reveal.
+- Use separate scenes when the location, action, camera framing,
+  character emotion or important visual detail changes.
+- For a long story, aim for approximately 25-45 visual scenes
+  when the story length supports it.
+- Do not artificially add scenes or repeat the same moment.
+- Keep all scenes in the exact chronological order.
+- Each scene should describe one clear visual moment.
+- Write detailed image prompts suitable for cinematic 16:9 horror images.
+- Maintain consistent appearance of recurring characters.
+- Maintain consistent appearance of recurring locations and entities.
+- Do not put multiple unrelated moments into one scene.
 
 OUTPUT:
-Return ONLY valid JSON. Do not include Markdown or explanations.
+Return ONLY valid JSON. No Markdown fences and no explanation.
 
-Use this exact JSON structure:
+Use this exact overall structure:
 
 {{
-  "title": "Story title",
+  "title": "Original story title",
   "language": "Hindi",
-  "genre": ["Horror", "Suspense", "Thriller"],
-  "story_summary": "Complete story summary",
-  "ending_summary": "Original ending description",
+  "genre": "Horror",
+  "story_summary": "Short summary for production reference",
+  "ending_summary": "Summary of the original ending",
   "characters": [
     {{
-      "name": "Character name",
-      "age": "Age if known",
-      "appearance": "Visible physical appearance",
-      "clothing": "Clothing description",
-      "personality": "Personality",
-      "role": "Role in story",
-      "visual_consistency_notes": "Features that must remain consistent"
+      "name": "Exact character name",
+      "description": "Visual appearance and age if stated",
+      "clothing": "Clothing as supported by the story",
+      "role": "Role in the original story"
     }}
   ],
   "locations": [
     {{
       "name": "Location name",
-      "description": "Visual description",
-      "atmosphere": "Mood and atmosphere",
-      "lighting": "Lighting details",
-      "visual_consistency_notes": "Details to preserve"
+      "description": "Visual environment",
+      "atmosphere": "Lighting and mood"
     }}
   ],
   "entities": [
     {{
       "name": "Entity name",
-      "description": "Appearance and characteristics",
-      "behavior": "Behavior in the story",
-      "visual_consistency_notes": "Details to preserve"
+      "description": "Visual appearance",
+      "behavior": "Behavior shown in the story"
     }}
   ],
   "scenes": [
     {{
       "scene_number": 1,
-      "story_event": "Original event in this scene",
-      "characters_present": [],
+      "scene_title": "Short scene title",
+      "narration": "Short visual reference only. Never use this as the final voiceover.",
+      "visual_description": "Detailed description of exactly what is visible in this moment",
+      "image_prompt": "Complete cinematic image-generation prompt in English. Preserve character and location consistency. 16:9, no text, no watermark.",
+      "characters": ["Character names appearing in this scene"],
       "location": "Location name",
-      "visual_description": "Detailed cinematic visual",
-      "camera_angle": "Camera angle and movement",
-      "lighting": "Lighting design",
-      "atmosphere": "Mood and suspense",
-      "narration": "Hindi narration for this scene",
-      "dialogue": [],
-      "sound_effects": [],
-      "continuity_notes": "Visual continuity requirements"
+      "mood": "Horror atmosphere",
+      "camera_angle": "Suggested cinematic camera angle"
     }}
   ]
 }}
 
-IMPORTANT:
-- Include every important event from the original story.
-- Use as many scenes as necessary.
-- Do not force the story into a fixed runtime.
-- Do not create repetitive or filler scenes.
-- Keep character and location descriptions consistent.
-- Do not invent unknown ages, appearances or facts.
-- Use null or "Not specified in story" when information is unavailable.
+If a detail is not specified in the original story, do not invent
+a specific factual detail. Use a visually neutral description.
 
-COMPLETE ORIGINAL STORY:
+COMPLETE ORIGINAL STORY STARTS BELOW:
 
 {story}
+
+COMPLETE ORIGINAL STORY ENDS ABOVE.
 """
 
 
-# ---------------------------------------------------------
-# JSON EXTRACTION AND VALIDATION
-# ---------------------------------------------------------
+def extract_json(response_text):
+    """Extract JSON safely from model output."""
 
-def extract_json(text):
-    if not text:
+    if not isinstance(response_text, str) or not response_text.strip():
         raise ValueError("AI returned an empty response.")
 
-    text = text.strip()
+    text = response_text.strip()
 
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+    # Remove optional Markdown code fences.
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+    )
 
     start = text.find("{")
     end = text.rfind("}")
 
-    if start == -1 or end == -1:
-        raise ValueError("AI did not return valid JSON.")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("AI response does not contain valid JSON.")
 
-    return json.loads(text[start:end + 1])
+    parsed = json.loads(text[start:end + 1])
+
+    if not isinstance(parsed, dict):
+        raise ValueError("AI analysis must be a JSON object.")
+
+    return parsed
 
 
 def validate_analysis(analysis):
+    """Validate and normalize the visual analysis."""
+
     if not isinstance(analysis, dict):
         raise ValueError("Analysis must be a JSON object.")
 
-    if not isinstance(analysis.get("scenes"), list):
-        raise ValueError("Analysis does not contain a valid scenes list.")
+    scenes = analysis.get("scenes")
 
-    if len(analysis["scenes"]) == 0:
-        raise ValueError("Analysis contains zero scenes.")
+    if not isinstance(scenes, list) or not scenes:
+        raise ValueError("AI did not return any visual scenes.")
 
-    for index, scene in enumerate(analysis["scenes"], start=1):
+    normalized_scenes = []
+
+    for index, scene in enumerate(scenes, start=1):
+
         if not isinstance(scene, dict):
-            raise ValueError(
-                f"Scene {index} is not a valid JSON object."
+            continue
+
+        scene["scene_number"] = index
+
+        # Support common alternate field names.
+        if not scene.get("visual_description"):
+            scene["visual_description"] = (
+                scene.get("description")
+                or scene.get("visual")
+                or ""
             )
 
-    analysis["total_scenes"] = len(analysis["scenes"])
+        if not scene.get("image_prompt"):
+            scene["image_prompt"] = (
+                scene.get("prompt")
+                or scene.get("visual_description")
+                or ""
+            )
+
+        if not scene.get("narration"):
+            scene["narration"] = (
+                scene.get("visual_description")
+                or scene.get("scene_title")
+                or ""
+            )
+
+        if not isinstance(scene.get("characters"), list):
+            scene["characters"] = []
+
+        normalized_scenes.append(scene)
+
+    if not normalized_scenes:
+        raise ValueError("No valid visual scenes were returned.")
+
+    analysis["scenes"] = normalized_scenes
+    analysis["total_scenes"] = len(normalized_scenes)
+
+    # Ensure expected top-level fields exist.
+    analysis.setdefault("title", "Untitled Horror Story")
+    analysis.setdefault("language", "Hindi")
+    analysis.setdefault("genre", "Horror")
+    analysis.setdefault("story_summary", "")
+    analysis.setdefault("ending_summary", "")
+    analysis.setdefault("characters", [])
+    analysis.setdefault("locations", [])
+    analysis.setdefault("entities", [])
 
     return analysis
 
 
-# ---------------------------------------------------------
-# RETRY CONFIGURATION
-# ---------------------------------------------------------
+def generate_with_gemini(prompt, model):
+    """Generate visual analysis using Gemini."""
 
-def get_error_status(error):
-    status = getattr(error, "code", None)
+    api_key = get_api_key()
 
-    if status is None:
-        status = getattr(error, "status_code", None)
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is missing.")
 
-    if status is None:
-        response = getattr(error, "response", None)
-        status = getattr(response, "status_code", None)
-
-    try:
-        return int(status) if status is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def is_retryable_error(error):
-    status = get_error_status(error)
-
-    # Temporary server, rate-limit and network errors.
-    if status in (408, 409, 425, 429, 500, 502, 503, 504):
-        return True
-
-    # Permanent authentication, permission or model errors.
-    if status in (400, 401, 403, 404):
-        return False
-
-    # Invalid JSON / empty AI response can be retried.
-    if isinstance(error, (ValueError, json.JSONDecodeError)):
-        return True
-
-    # Network errors without an HTTP status can be temporary.
-    if isinstance(error, (TimeoutError, ConnectionError)):
-        return True
-
-    return status is None
-
-
-def wait_before_retry(attempt, base_delay):
-    # Exponential backoff with small random jitter.
-    delay = min(base_delay * (2 ** (attempt - 1)), 60)
-    delay += random.uniform(0, 2)
-
-    logger.warning(
-        "Retrying after %.1f seconds...",
-        delay
-    )
-
-    time.sleep(delay)
-
-
-# ---------------------------------------------------------
-# GEMINI PROVIDER
-# ---------------------------------------------------------
-
-def generate_with_gemini(
-    prompt,
-    api_key,
-    model_name,
-    max_retries,
-    retry_delay
-):
     client = genai.Client(api_key=api_key)
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(
-                "Gemini story analysis attempt %s/%s",
-                attempt,
-                max_retries
-            )
-
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.4
-                )
-            )
-
-            if not response.text:
-                raise ValueError("Gemini returned an empty response.")
-
-            analysis = extract_json(response.text)
-            analysis = validate_analysis(analysis)
-
-            logger.info(
-                "Gemini analysis successful. Scenes: %s",
-                analysis["total_scenes"]
-            )
-
-            return analysis
-
-        except Exception as error:
-            logger.exception(
-                "Gemini attempt %s failed: %s",
-                attempt,
-                error
-            )
-
-            if attempt >= max_retries:
-                break
-
-            if not is_retryable_error(error):
-                logger.warning(
-                    "Gemini error is not retryable. Switching provider."
-                )
-                break
-
-            wait_before_retry(attempt, retry_delay)
-
-    raise RuntimeError(
-        "Gemini failed after retries. OpenRouter fallback required."
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.2,
+        ),
     )
 
+    if not response or not response.text:
+        raise RuntimeError("Gemini returned an empty response.")
 
-# ---------------------------------------------------------
-# OPENROUTER PROVIDER
-# ---------------------------------------------------------
+    return response.text
 
-def generate_with_openrouter(
-    prompt,
-    api_key,
-    model_name,
-    max_retries,
-    retry_delay
-):
+
+def generate_with_openrouter(prompt, model):
+    """Generate visual analysis using OpenRouter fallback."""
+
+    api_key = os.getenv("OPENROUTER_API_KEY")
+
     if not api_key:
-        raise RuntimeError(
-            "OPENROUTER_API_KEY is missing. "
-            "Add it in GitHub Repository Secrets."
+        raise ValueError("OPENROUTER_API_KEY is missing.")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional horror storyboard artist. "
+                    "Return only valid JSON. Follow the user's schema "
+                    "and preserve the original story."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        "response_format": {
+            "type": "json_object"
+        },
+        "temperature": 0.2,
+        "max_tokens": 12000,
+    }
+
+    request = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/",
+            "X-Title": "Hindi Horror Story Automation",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=240,
+        ) as response:
+            response_data = json.loads(
+                response.read().decode("utf-8")
+            )
+
+    except urllib.error.HTTPError as error:
+        error_body = error.read().decode(
+            "utf-8",
+            errors="replace",
         )
 
-    url = "https://openrouter.ai/api/v1/chat/completions"
+        raise RuntimeError(
+            f"OpenRouter HTTP {error.code}: {error_body[:1500]}"
+        ) from error
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(
-                "OpenRouter fallback attempt %s/%s using %s",
-                attempt,
-                max_retries,
-                model_name
-            )
+    choices = response_data.get("choices", [])
 
-            payload = {
-                "model": model_name,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an expert Hindi horror film "
-                            "director and screenplay analyst. "
-                            "Follow the user's instructions exactly. "
-                            "Return only valid JSON."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.4,
-                "response_format": {
-                    "type": "json_object"
-                }
-            }
+    if not choices:
+        raise RuntimeError(
+            "OpenRouter returned no choices."
+        )
 
-            request_data = json.dumps(payload).encode("utf-8")
+    content = choices[0].get("message", {}).get("content")
 
-            request = urllib.request.Request(
-                url,
-                data=request_data,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://github.com/",
-                    "X-Title": "Horror Story Automation"
-                },
-                method="POST"
-            )
+    if isinstance(content, list):
+        content = "".join(
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict)
+        )
 
-            with urllib.request.urlopen(
-                request,
-                timeout=180
-            ) as response:
-                response_body = response.read().decode("utf-8")
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError(
+            "OpenRouter returned empty analysis content."
+        )
 
-            result = json.loads(response_body)
+    return content
 
-            choices = result.get("choices", [])
-
-            if not choices:
-                raise ValueError(
-                    "OpenRouter returned no choices."
-                )
-
-            message = choices[0].get("message", {})
-            content = message.get("content")
-
-            if isinstance(content, list):
-                content = "".join(
-                    item.get("text", "")
-                    for item in content
-                    if isinstance(item, dict)
-                )
-
-            if not content:
-                raise ValueError(
-                    "OpenRouter returned empty content."
-                )
-
-            analysis = extract_json(content)
-            analysis = validate_analysis(analysis)
-
-            logger.info(
-                "OpenRouter analysis successful. Scenes: %s",
-                analysis["total_scenes"]
-            )
-
-            return analysis
-
-        except urllib.error.HTTPError as error:
-            status = error.code
-            details = error.read().decode(
-                "utf-8",
-                errors="replace"
-            )
-
-            logger.error(
-                "OpenRouter HTTP error %s: %s",
-                status,
-                details[:1500]
-            )
-
-            if status in (400, 401, 403, 404):
-                raise RuntimeError(
-                    f"OpenRouter rejected the request (HTTP {status}). "
-                    "Check the API key and configured model."
-                ) from error
-
-            if attempt >= max_retries:
-                raise
-
-            wait_before_retry(attempt, retry_delay)
-
-        except Exception as error:
-            logger.exception(
-                "OpenRouter attempt %s failed: %s",
-                attempt,
-                error
-            )
-
-            if attempt >= max_retries:
-                raise
-
-            if not is_retryable_error(error):
-                raise
-
-            wait_before_retry(attempt, retry_delay)
-
-    raise RuntimeError("OpenRouter failed after all retries.")
-
-
-# ---------------------------------------------------------
-# SAVE ANALYSIS
-# ---------------------------------------------------------
 
 def save_analysis(analysis):
-    output_path = PROJECT_ROOT / "output" / "story_analysis.json"
+    """Save final analysis JSON."""
 
-    save_json(analysis, output_path)
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    logger.info(
-        "Story analysis saved successfully: %s",
-        output_path
+    with open(
+        ANALYSIS_FILE,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            analysis,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    LOGGER.info(
+        "Story analysis saved: %s",
+        ANALYSIS_FILE,
     )
+
+
+def analyze_story():
+    """Run complete story analysis while preserving original narration."""
+
+    create_project_directories()
+
+    config = load_config()
+    settings = get_generation_settings(config)
+
+    # Read the original story once.
+    original_story = read_story()
+
+    prompt = build_analysis_prompt(original_story)
+
+    analysis = None
+    provider_used = None
+    model_used = None
+    last_error = None
+
+    # Try Gemini first.
+    for attempt in range(
+        1,
+        settings["max_retries"] + 1,
+    ):
+        try:
+            LOGGER.info(
+                "Gemini analysis attempt %s/%s",
+                attempt,
+                settings["max_retries"],
+            )
+
+            response_text = generate_with_gemini(
+                prompt,
+                settings["gemini_model"],
+            )
+
+            analysis = validate_analysis(
+                extract_json(response_text)
+            )
+
+            provider_used = "Gemini"
+            model_used = settings["gemini_model"]
+            break
+
+        except Exception as error:
+            last_error = error
+
+            LOGGER.warning(
+                "Gemini attempt %s failed: %s",
+                attempt,
+                error,
+            )
+
+            if attempt < settings["max_retries"]:
+                time.sleep(settings["retry_delay"])
+
+    # Use OpenRouter if Gemini did not succeed.
+    if analysis is None:
+
+        LOGGER.warning(
+            "Gemini failed. Trying OpenRouter fallback."
+        )
+
+        for attempt in range(
+            1,
+            settings["max_retries"] + 1,
+        ):
+            try:
+                LOGGER.info(
+                    "OpenRouter attempt %s/%s",
+                    attempt,
+                    settings["max_retries"],
+                )
+
+                response_text = generate_with_openrouter(
+                    prompt,
+                    settings["openrouter_model"],
+                )
+
+                analysis = validate_analysis(
+                    extract_json(response_text)
+                )
+
+                provider_used = "OpenRouter"
+                model_used = settings["openrouter_model"]
+                break
+
+            except Exception as error:
+                last_error = error
+
+                LOGGER.warning(
+                    "OpenRouter attempt %s failed: %s",
+                    attempt,
+                    error,
+                )
+
+                if attempt < settings["max_retries"]:
+                    time.sleep(settings["retry_delay"])
+
+    if analysis is None:
+        raise RuntimeError(
+            "Both AI providers failed to analyze the story. "
+            f"Last error: {last_error}"
+        )
+
+    # CRITICAL:
+    # These fields come directly from input/story.txt.
+    # The AI response is never allowed to replace them.
+    analysis["original_story"] = original_story
+    analysis["narration_script"] = original_story
+    analysis["narration_source"] = "input/story.txt"
+
+    analysis["original_story_characters"] = len(original_story)
+    analysis["narration_characters"] = len(original_story)
+
+    analysis["analysis_provider"] = provider_used
+    analysis["analysis_model"] = model_used
+
+    # Explicitly mark scene narration as visual reference only.
+    analysis["scene_narration_is_voiceover"] = False
+
+    save_analysis(analysis)
+
+    LOGGER.info("--------------------------------------")
+    LOGGER.info("STORY ANALYSIS COMPLETED")
+    LOGGER.info("Title: %s", analysis.get("title"))
+    LOGGER.info("Scenes: %s", analysis.get("total_scenes"))
+    LOGGER.info("Original story characters: %s", len(original_story))
+    LOGGER.info("Narration characters: %s", len(analysis["narration_script"]))
+    LOGGER.info("Provider: %s", provider_used)
+    LOGGER.info("Model: %s", model_used)
+    LOGGER.info("--------------------------------------")
 
     return analysis
 
 
-# ---------------------------------------------------------
-# MAIN ANALYSIS PIPELINE
-# ---------------------------------------------------------
+def main():
+    """Main entry point."""
 
-def analyze_story():
-    config = load_config()
-    story = read_story()
+    setup_logging()
 
-    if not story or not story.strip():
-        raise ValueError("Story file is empty.")
+    LOGGER.info("Starting Hindi horror story analysis.")
 
-    generation_config = config["generation"]
-
-    model_name = generation_config["text_model"]
-
-    max_retries = max(
-        1,
-        int(generation_config.get("max_retries", 3))
-    )
-
-    retry_delay = max(
-        1,
-        int(generation_config.get("retry_delay_seconds", 5))
-    )
-
-    openrouter_model = (
-        generation_config.get("openrouter_text_model")
-        or os.getenv(
-            "OPENROUTER_MODEL",
-            "openai/gpt-4o-mini"
-        )
-    )
-
-    gemini_api_key = get_api_key()
-    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-
-    prompt = build_analysis_prompt(story)
-
-    logger.info("Starting story analysis.")
-    logger.info("Primary provider: Gemini")
-    logger.info("Fallback provider: OpenRouter")
-
-    # First attempt: Gemini.
-    try:
-        analysis = generate_with_gemini(
-            prompt=prompt,
-            api_key=gemini_api_key,
-            model_name=model_name,
-            max_retries=max_retries,
-            retry_delay=retry_delay
-        )
-
-        analysis["ai_provider"] = "Gemini"
-        analysis["ai_model"] = model_name
-
-        return save_analysis(analysis)
-
-    except Exception as gemini_error:
-        logger.error(
-            "Gemini unavailable. Activating OpenRouter fallback. "
-            "Reason: %s",
-            gemini_error
-        )
-
-    # Second attempt: OpenRouter automatic fallback.
-    try:
-        analysis = generate_with_openrouter(
-            prompt=prompt,
-            api_key=openrouter_api_key,
-            model_name=openrouter_model,
-            max_retries=max_retries,
-            retry_delay=retry_delay
-        )
-
-        analysis["ai_provider"] = "OpenRouter"
-        analysis["ai_model"] = openrouter_model
-
-        return save_analysis(analysis)
-
-    except Exception as openrouter_error:
-        logger.exception(
-            "Both Gemini and OpenRouter failed."
-        )
-
-        raise RuntimeError(
-            "Story analysis failed on both AI providers. "
-            f"Gemini model: {model_name}. "
-            f"OpenRouter model: {openrouter_model}. "
-            f"OpenRouter error: {openrouter_error}"
-        ) from openrouter_error
+    analyze_story()
 
 
 if __name__ == "__main__":
-    analyze_story()
+    try:
+        main()
+
+    except Exception:
+        logging.exception("Story analysis failed.")
+        raise
