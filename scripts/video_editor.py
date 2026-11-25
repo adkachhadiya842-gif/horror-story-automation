@@ -554,13 +554,17 @@ def create_camera_filter(
     Safe FFmpeg zoompan expressions.
 
     Alternating zoom and directional pan.
-    Uses d+1 to avoid invalid max() expression parsing.
+    Uses a Python-calculated last-frame denominator; FFmpeg zoompan has no d variable in x/y expressions.
     """
 
     if frame_count <= 0:
         raise ValueError(
             "Camera frame count must be positive."
         )
+
+    # zoompan x/y expressions support on (output frame number), not d.
+    # Use the last valid output frame index to normalize pan movement.
+    last_frame = max(frame_count - 1, 1)
 
     if not zoom_enabled and not pan_enabled:
         return ",".join([
@@ -605,7 +609,7 @@ def create_camera_filter(
 
         if direction == 0:
             x_expression = (
-                "(iw-iw/zoom)*on/(d+1)"
+                f"(iw-iw/zoom)*on/{last_frame}"
             )
             y_expression = (
                 "ih/2-ih/zoom/2"
@@ -613,7 +617,7 @@ def create_camera_filter(
 
         elif direction == 1:
             x_expression = (
-                "(iw-iw/zoom)*(1-on/(d+1))"
+                f"(iw-iw/zoom)*(1-on/{last_frame})"
             )
             y_expression = (
                 "ih/2-ih/zoom/2"
@@ -624,7 +628,7 @@ def create_camera_filter(
                 "iw/2-iw/zoom/2"
             )
             y_expression = (
-                "(ih-ih/zoom)*on/(d+1)"
+                f"(ih-ih/zoom)*on/{last_frame}"
             )
 
         else:
@@ -632,7 +636,7 @@ def create_camera_filter(
                 "iw/2-iw/zoom/2"
             )
             y_expression = (
-                "(ih-ih/zoom)*(1-on/(d+1))"
+                f"(ih-ih/zoom)*(1-on/{last_frame})"
             )
 
     else:
