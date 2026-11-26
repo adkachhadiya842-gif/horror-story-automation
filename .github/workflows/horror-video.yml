@@ -1,4 +1,32 @@
 
+name: Horror Video Automation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: horror-video-production
+  cancel-in-progress: false
+
+jobs:
+  generate-horror-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
       - name: Install FFmpeg and Hindi subtitle dependencies
         run: |
           sudo apt-get update
@@ -10,33 +38,95 @@
             libass9 \
             libharfbuzz0b \
             libfribidi0
-
           sudo fc-cache -f -v
 
       - name: Verify Hindi subtitle rendering support
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "========== FFMPEG =========="
           ffmpeg -version
-
-          echo "========== SUBTITLES FILTER =========="
           ffmpeg -hide_banner -filters | grep subtitles
           ffmpeg -hide_banner -h filter=subtitles
-
-          echo "========== HINDI FONT =========="
           fc-match "Noto Sans Devanagari"
           fc-match -f "%{file}\n" "Noto Sans Devanagari"
-
-          echo "========== FONT FILES =========="
           find /usr/share/fonts -iname "*Devanagari*"
 
-          echo "========== LINKED LIBRARIES =========="
-          ldd "$(command -v ffmpeg)" | grep -Ei "ass|harfbuzz|fribidi" || true
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-          echo "========== FONT DIRECTORY =========="
-          test -d /usr/share/fonts/truetype/noto
-          test -f /usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf
+      - name: Verify project structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f requirements.txt
+          test -f config/config.json
+          test -f input/story.txt
+          test -f scripts/__init__.py
+          test -f scripts/pipeline.py
+          test -f scripts/story_analyzer.py
+          test -f scripts/voice_generator.py
+          test -f scripts/image_generator.py
+          test -f scripts/sound_designer.py
+          test -f scripts/subtitle_generator.py
+          test -f scripts/video_editor.py
+          test -f scripts/thumbnail_generator.py
+          echo "All required project files found."
 
-          echo "Hindi subtitle dependency checks completed."
+      - name: Validate API secrets
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GEMINI_API_KEY" || {
+            echo "GEMINI_API_KEY is missing."
+            exit 1
+          }
+          test -n "$OPENROUTER_API_KEY" || {
+            echo "OPENROUTER_API_KEY is missing."
+            exit 1
+          }
+          echo "API secrets are available."
+
+      - name: Generate complete horror video
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python -u -m scripts.pipeline
+
+      - name: Verify final production files
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s output/final_video.mp4
+          test -s output/thumbnail/youtube_thumbnail.jpg
+          test -s output/pipeline_report.json
+          ffprobe -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1 \
+            output/final_video.mp4
+          echo "Production output verification completed."
+
+      - name: Upload production artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horror-video-production-${{ github.run_number }}
+          path: |
+            output/final_video.mp4
+            output/thumbnail/youtube_thumbnail.jpg
+            output/pipeline_report.json
+            output/voice_generation_report.json
+            output/image_generation_report.json
+            output/video_edit_report.json
+            output/story_analysis.json
+            output/audio/
+            output/subtitles/
+          if-no-files-found: warn
+          retention-days: 14
