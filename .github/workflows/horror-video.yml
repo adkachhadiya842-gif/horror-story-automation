@@ -1,176 +1,42 @@
 
-name: Horror Video Automation
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  actions: read
-
-jobs:
-  generate-horror-video:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      # Find the latest previous run that contains the audio resume artifact.
-      - name: Find previous audio resume
-        id: find_resume
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const workflowRef = process.env.GITHUB_WORKFLOW_REF || "";
-            const workflowPath = workflowRef
-              .split("/")
-              .slice(2)
-              .join("/")
-              .split("@")[0];
-
-            const workflowFile = workflowPath.split("/").pop();
-
-            if (!workflowFile) {
-              core.warning("Could not determine workflow filename.");
-              core.setOutput("run_id", "");
-              return;
-            }
-
-            core.info(`Searching previous runs of ${workflowFile}`);
-
-            const runsResponse = await github.rest.actions.listWorkflowRuns({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: workflowFile,
-              per_page: 100
-            });
-
-            const previousRuns = runsResponse.data.workflow_runs
-              .filter(run => run.id !== context.runId)
-              .sort((a, b) => b.id - a.id);
-
-            let resumeRunId = "";
-
-            for (const run of previousRuns) {
-              const artifactsResponse =
-                await github.rest.actions.listWorkflowRunArtifacts({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  run_id: run.id,
-                  per_page: 100
-                });
-
-              const resumeArtifact =
-                artifactsResponse.data.artifacts.find(
-                  artifact =>
-                    artifact.name === "horror-audio-resume" &&
-                    artifact.expired === false
-                );
-
-              if (resumeArtifact) {
-                resumeRunId = String(run.id);
-                core.info(
-                  `Found audio resume artifact in previous run ${run.id}`
-                );
-                break;
-              }
-            }
-
-            if (!resumeRunId) {
-              core.info("No previous audio resume artifact found.");
-            }
-
-            core.setOutput("run_id", resumeRunId);
-
-      # Download the artifact from the previous workflow run.
-      - name: Restore previous audio chunks
-        if: steps.find_resume.outputs.run_id != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: horror-audio-resume
-          path: output/audio/chunks/
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.find_resume.outputs.run_id }}
-
-      - name: Install FFmpeg and Hindi fonts
+      - name: Install FFmpeg and Hindi subtitle dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-core fontconfig
-          fc-cache -f -v
+          sudo apt-get install -y \
+            ffmpeg \
+            fontconfig \
+            fonts-noto-core \
+            fonts-noto-extra \
+            libass9 \
+            libharfbuzz0b \
+            libfribidi0
 
-      - name: Verify FFmpeg and Hindi font support
+          sudo fc-cache -f -v
+
+      - name: Verify Hindi subtitle rendering support
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Checking FFmpeg..."
+          echo "========== FFMPEG =========="
           ffmpeg -version
 
-          echo "Checking subtitles filter..."
+          echo "========== SUBTITLES FILTER =========="
           ffmpeg -hide_banner -filters | grep subtitles
+          ffmpeg -hide_banner -h filter=subtitles
 
-          echo "Checking drawtext filter..."
-          ffmpeg -hide_banner -filters | grep drawtext
-
-          echo "Checking drawtext text shaping support..."
-          ffmpeg -hide_banner -h filter=drawtext 2>&1 | grep text_shaping
-
-          echo "Checking Hindi font files..."
-          test -f /usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf
-          test -f /usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf
-
+          echo "========== HINDI FONT =========="
           fc-match "Noto Sans Devanagari"
+          fc-match -f "%{file}\n" "Noto Sans Devanagari"
 
-          echo "FFmpeg and Hindi font checks passed."
+          echo "========== FONT FILES =========="
+          find /usr/share/fonts -iname "*Devanagari*"
 
-      - name: Install Python packages
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          echo "========== LINKED LIBRARIES =========="
+          ldd "$(command -v ffmpeg)" | grep -Ei "ass|harfbuzz|fribidi" || true
 
-      - name: Create output folders
-        run: |
-          mkdir -p output/images
-          mkdir -p output/audio
-          mkdir -p output/audio/chunks
-          mkdir -p output/subtitles
-          mkdir -p output/thumbnail
-          mkdir -p output/assets
+          echo "========== FONT DIRECTORY =========="
+          test -d /usr/share/fonts/truetype/noto
+          test -f /usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf
 
-      - name: Run horror production pipeline
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          python -m scripts.pipeline
-
-      # Save audio chunks so the next manual run can resume from them.
-      - name: Save audio chunks for next run
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: horror-audio-resume
-          path: output/audio/chunks/
-          if-no-files-found: ignore
-          retention-days: 7
-          overwrite: true
-
-      # Upload all production outputs, even if the pipeline fails.
-      - name: Upload generated files
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: horror-video-production
-          path: output/
-          if-no-files-found: warn
-          retention-days: 7
+          echo "Hindi subtitle dependency checks completed."
