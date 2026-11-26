@@ -1,4 +1,36 @@
 
+name: Horror Video Automation
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: horror-video-production
+  cancel-in-progress: false
+
+jobs:
+  generate-horror-video:
+    name: Generate Horror Video
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Setup Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      # 3. Install FFmpeg and Hindi subtitle dependencies
       - name: Install FFmpeg and Hindi subtitle dependencies
         run: |
           sudo apt-get update
@@ -13,6 +45,7 @@
 
           sudo fc-cache -f -v
 
+      # 4. Verify FFmpeg and Hindi fonts
       - name: Verify Hindi subtitle rendering support
         shell: bash
         run: |
@@ -29,14 +62,120 @@
           fc-match "Noto Sans Devanagari"
           fc-match -f "%{file}\n" "Noto Sans Devanagari"
 
-          echo "========== FONT FILES =========="
+          echo "========== DEVANAGARI FONT FILES =========="
           find /usr/share/fonts -iname "*Devanagari*"
 
-          echo "========== LINKED LIBRARIES =========="
-          ldd "$(command -v ffmpeg)" | grep -Ei "ass|harfbuzz|fribidi" || true
+          echo "Hindi subtitle dependencies verified."
 
-          echo "========== FONT DIRECTORY =========="
-          test -d /usr/share/fonts/truetype/noto
-          test -f /usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf
+      # 5. Install Python dependencies
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-          echo "Hindi subtitle dependency checks completed."
+      # 6. Verify Python environment
+      - name: Verify Python environment
+        run: |
+          python --version
+          pip --version
+          ffmpeg -version
+
+          python -c "import PIL; print('Pillow:', PIL.__version__)"
+          python -c "import google.genai; print('Google GenAI SDK: OK')"
+
+      # 7. Verify project structure
+      - name: Verify project structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f requirements.txt
+          test -f config/config.json
+          test -f input/story.txt
+
+          test -f scripts/__init__.py
+          test -f scripts/pipeline.py
+          test -f scripts/utils.py
+          test -f scripts/validators.py
+          test -f scripts/story_analyzer.py
+          test -f scripts/voice_generator.py
+          test -f scripts/image_generator.py
+          test -f scripts/sound_designer.py
+          test -f scripts/subtitle_generator.py
+          test -f scripts/video_editor.py
+          test -f scripts/thumbnail_generator.py
+
+          echo "All required project files found."
+
+      # 8. Validate API secrets
+      - name: Validate API secrets
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "ERROR: GEMINI_API_KEY is missing."
+            exit 1
+          fi
+
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "ERROR: OPENROUTER_API_KEY is missing."
+            exit 1
+          fi
+
+          echo "Required API secrets are available."
+
+      # 9. Run complete production pipeline
+      - name: Generate complete horror video
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python -u -m scripts.pipeline
+
+      # 10. Verify final production files
+      - name: Verify final production files
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s output/final_video.mp4
+          test -s output/thumbnail/youtube_thumbnail.jpg
+          test -s output/pipeline_report.json
+
+          echo "========== VIDEO INFORMATION =========="
+
+          ffprobe -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1 \
+            output/final_video.mp4
+
+          echo "========== THUMBNAIL =========="
+
+          file output/thumbnail/youtube_thumbnail.jpg
+
+          echo "Production output verification completed."
+
+      # 11. Upload production artifacts
+      - name: Upload production artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: horror-video-production-${{ github.run_number }}
+          path: |
+            output/final_video.mp4
+            output/thumbnail/youtube_thumbnail.jpg
+            output/pipeline_report.json
+            output/voice_generation_report.json
+            output/image_generation_report.json
+            output/video_edit_report.json
+            output/story_analysis.json
+            output/audio/
+            output/subtitles/
+          if-no-files-found: warn
+          retention-days: 14
