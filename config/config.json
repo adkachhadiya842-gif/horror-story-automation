@@ -33,6 +33,94 @@
     "location_consistency": true,
     "entity_consistency": true
   },
+  "animation": {
+    "enabled": true,
+    "engine": "hybrid_2d_cutout",
+    "style": "cinematic_2d_documentary",
+    "resolution": "1920x1080",
+    "fps": 24,
+
+    "layers": {
+      "enabled": true,
+      "background": true,
+      "midground": true,
+      "characters": true,
+      "foreground": true,
+      "atmosphere": true,
+      "overlays": true,
+      "depth_levels": 5
+    },
+
+    "character_animation": {
+      "enabled": true,
+      "character_consistency": true,
+      "prefer_separate_body_parts": true,
+      "support_multiple_poses": true,
+      "idle_breathing": true,
+      "head_movement": true,
+      "eye_blink": true,
+      "arm_gestures": true,
+      "body_movement": true,
+      "fallback_to_static_pose": true
+    },
+
+    "camera": {
+      "enabled": true,
+      "pan": true,
+      "zoom": true,
+      "tracking": true,
+      "parallax": true,
+      "smooth_motion": true,
+      "max_zoom": 1.18,
+      "max_pan_percent": 8
+    },
+
+    "effects": {
+      "enabled": true,
+      "fog": true,
+      "smoke": true,
+      "rain": true,
+      "dust_particles": true,
+      "light_flicker": true,
+      "shadows": true,
+      "vignette": true,
+      "film_grain": true
+    },
+
+    "motion_graphics": {
+      "enabled": true,
+      "maps": true,
+      "timelines": true,
+      "location_labels": true,
+      "evidence_boards": true,
+      "documentary_text": true
+    },
+
+    "timeline": {
+      "mode": "narration_weighted",
+      "sync_with_audio": true,
+      "scene_transition": true,
+      "avoid_unnecessary_gaps": true
+    },
+
+    "transitions": {
+      "enabled": true,
+      "crossfade": true,
+      "fade_to_black": true,
+      "cinematic_wipe": true,
+      "duration_seconds": 0.8
+    },
+
+    "rendering": {
+      "format": "mp4",
+      "codec": "libx264",
+      "pixel_format": "yuv420p",
+      "preset": "medium",
+      "crf": 20,
+      "audio_codec": "aac",
+      "audio_bitrate": "192k"
+    }
+  },
   "audio": {
     "voice_generation": true,
     "voice_language": "hi-IN",
@@ -52,10 +140,10 @@
     "height": 720
   },
   "generation": {
-  "image_model": "gemini-2.5-flash-image",
-  "text_model": "gemini-3.8-flash",
-  "openrouter_text_model": "openai/gpt-4o-mini",
-  "max_retries": 3,
-  "retry_delay_seconds": 5
-}
+    "image_model": "gemini-2.5-flash-image",
+    "text_model": "gemini-3.8-flash",
+    "openrouter_text_model": "openai/gpt-4o-mini",
+    "max_retries": 3,
+    "retry_delay_seconds": 5
+  }
 }
