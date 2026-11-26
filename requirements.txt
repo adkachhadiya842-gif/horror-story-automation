@@ -1,10 +1,10 @@
 
 google-genai>=2.25.0
-Pillow
-moviepy
-numpy
-pydub
-srt
-python-dotenv
-requests
-tqdm
+Pillow>=10.0.0
+moviepy>=2.0.0
+numpy>=1.26.0
+pydub>=0.25.1
+srt>=3.5.3
+python-dotenv>=1.0.0
+requests>=2.31.0
+tqdm>=4.66.0
