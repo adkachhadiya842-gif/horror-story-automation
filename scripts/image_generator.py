@@ -1,4 +1,3 @@
-
 """
 Cinematic Horror Story - Image Generator
 OpenRouter Recraft image generation.
@@ -64,13 +63,23 @@ DEFAULT_MAX_SCENE_IMAGES_PER_RUN = 35
 DEFAULT_MAX_REFERENCE_IMAGES_PER_RUN = 5
 
 STYLE = (
-    "Premium cinematic photorealistic 3D horror film aesthetic, "
-    "extremely detailed realistic textures, natural human anatomy, "
-    "cinematic composition, dramatic film lighting, "
+    "Premium cinematic 2D illustrated documentary animation aesthetic, "
+    "semi-realistic hand-painted 2D artwork, detailed clean ink outlines, "
+    "natural human anatomy and believable facial expressions, "
+    "professional historical documentary illustration, "
     "realistic Indian environments when appropriate, "
-    "professional horror movie cinematography, "
-    "high visual fidelity, widescreen 16:9 composition. "
-    "No text, no captions, no logos, no watermarks."
+    "cinematic widescreen composition, rich painted backgrounds, "
+    "subtle paper and brush texture, high visual detail. "
+    "COLOR PALETTE: dominant dark navy blue (#071426) and steel blue "
+    "(#162C45), deep crimson red (#8F1728) used only as a restrained accent, "
+    "muted warm beige (#D5BDA0) for natural face and practical light tones. "
+    "LIGHTING: dramatic low-key lighting, cool blue shadows, subtle crimson "
+    "rim light only where motivated, soft volumetric light, strong but "
+    "controlled contrast, natural skin tones. "
+    "MOOD: serious, mysterious, suspenseful, cinematic documentary. "
+    "Avoid photorealistic photography, 3D CGI, plastic cartoon rendering, "
+    "childish bright colors, full-frame red or blue tint, excessive glow. "
+    "Widescreen 16:9 composition. No text, captions, logos, or watermarks."
 )
 
 RETRYABLE_HTTP_CODES = {408, 425, 500, 502, 503, 504, 529}
