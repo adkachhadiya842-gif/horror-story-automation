@@ -1,15 +1,24 @@
+
 """
-Cinematic Horror Story - Image Generator
-OpenRouter Recraft image generation.
+Cinematic 2D Documentary Image Generator
+Hybrid 2D Cut-Out / Puppet Animation preparation.
 
 Features:
-- Validates story analysis and configuration before cleaning outputs.
-- Generates scene images before optional reference sheets.
-- Limits free-model requests per run (configurable).
-- Stops immediately on HTTP 429 instead of wasting retries.
-- Retries temporary network/server errors with Retry-After support.
-- Validates and atomically saves image files.
-- Writes a report compatible with pipeline.py (scene_images key).
+- OpenRouter image generation (Recraft free model by default).
+- Non-destructive asset generation.
+- Character, location, entity and character-pose references.
+- Cinematic 2D scene illustrations.
+- RGBA preservation when the provider returns transparency.
+- Retry handling with Retry-After support.
+- Immediate stop on HTTP 429.
+- Atomic image saving and validation.
+- Pipeline-compatible scene_images report.
+- Animation-ready scene metadata.
+
+Important:
+A generated flat scene image is NOT a fully rigged puppet.
+Real limb animation requires separate body-part assets or multiple poses.
+This module prepares and stores those assets where possible.
 """
 
 import base64
@@ -23,6 +32,7 @@ import shutil
 import time
 import urllib.error
 import urllib.request
+
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,1003 +46,1867 @@ from scripts.utils import (
 )
 
 
-LOGGER = logging.getLogger(__name__)
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 DEFAULT_IMAGE_MODEL = "recraft/recraft-v4.1-flash-v2:free"
-IMAGE_MODEL = os.getenv(
+
+OPENROUTER_IMAGE_MODEL = os.getenv(
     "OPENROUTER_IMAGE_MODEL",
-    DEFAULT_IMAGE_MODEL,
-).strip() or DEFAULT_IMAGE_MODEL
+    DEFAULT_IMAGE_MODEL
+)
 
 IMAGE_API_URL = "https://openrouter.ai/api/v1/images"
 
-OUTPUT_ROOT = Path(OUTPUT_DIR)
-ANALYSIS_PATH = OUTPUT_ROOT / "story_analysis.json"
-ASSET_ROOT = OUTPUT_ROOT / "assets"
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-CHARACTER_DIR = ASSET_ROOT / "characters"
-LOCATION_DIR = ASSET_ROOT / "locations"
-ENTITY_DIR = ASSET_ROOT / "entities"
-SCENE_DIR = OUTPUT_ROOT / "images"
+ANALYSIS_FILE = OUTPUT_DIR / "story_analysis.json"
 
-REPORT_PATH = OUTPUT_ROOT / "image_generation_report.json"
+ASSET_DIR = OUTPUT_DIR / "assets"
 
-# The free model has request limits. Keep scene images as the priority.
-# Override with generation.max_scene_images_per_run in config.json.
-DEFAULT_MAX_SCENE_IMAGES_PER_RUN = 35
-DEFAULT_MAX_REFERENCE_IMAGES_PER_RUN = 5
+CHARACTER_DIR = ASSET_DIR / "characters"
+LOCATION_DIR = ASSET_DIR / "locations"
+ENTITY_DIR = ASSET_DIR / "entities"
+SCENE_ASSET_DIR = ASSET_DIR / "scenes"
 
-STYLE = (
-    "Premium cinematic 2D illustrated documentary animation aesthetic, "
-    "semi-realistic hand-painted 2D artwork, detailed clean ink outlines, "
-    "natural human anatomy and believable facial expressions, "
-    "professional historical documentary illustration, "
-    "realistic Indian environments when appropriate, "
-    "cinematic widescreen composition, rich painted backgrounds, "
-    "subtle paper and brush texture, high visual detail. "
-    "COLOR PALETTE: dominant dark navy blue (#071426) and steel blue "
-    "(#162C45), deep crimson red (#8F1728) used only as a restrained accent, "
-    "muted warm beige (#D5BDA0) for natural face and practical light tones. "
-    "LIGHTING: dramatic low-key lighting, cool blue shadows, subtle crimson "
-    "rim light only where motivated, soft volumetric light, strong but "
-    "controlled contrast, natural skin tones. "
-    "MOOD: serious, mysterious, suspenseful, cinematic documentary. "
-    "Avoid photorealistic photography, 3D CGI, plastic cartoon rendering, "
-    "childish bright colors, full-frame red or blue tint, excessive glow. "
-    "Widescreen 16:9 composition. No text, captions, logos, or watermarks."
-)
+IMAGE_DIR = OUTPUT_DIR / "images"
 
-RETRYABLE_HTTP_CODES = {408, 425, 500, 502, 503, 504, 529}
-NON_RETRYABLE_HTTP_CODES = {400, 401, 402, 403, 404, 405, 413, 415, 422}
+REPORT_FILE = OUTPUT_DIR / "image_generation_report.json"
+
+STAGING_DIR = OUTPUT_DIR / "image_staging"
+
+RETRYABLE_HTTP_CODES = {
+    408, 425, 500, 502, 503, 504, 529
+}
+
+NON_RETRYABLE_HTTP_CODES = {
+    400, 401, 402, 403, 404, 405, 413, 415, 422
+}
+
+MIN_IMAGE_SIZE = 256
+
+MAX_IMAGE_DIMENSION = 8192
+
+DEFAULT_TIMEOUT = 120
+
+DEFAULT_REFERENCE_LIMIT = 5
+
+DEFAULT_POSE_LIMIT = 2
+
+DEFAULT_SCENE_LIMIT = 35
 
 
-class ImageRateLimitError(RuntimeError):
-    """Raised when OpenRouter rejects an image request due to rate limits."""
+# ============================================================
+# LOGGING
+# ============================================================
 
+LOG_DIR = OUTPUT_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-def setup_logging():
-    log_dir = OUTPUT_ROOT / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+logger = logging.getLogger("image_generator")
+logger.setLevel(logging.INFO)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(
-                log_dir / "image_generator.log",
-                encoding="utf-8",
-            ),
-        ],
-        force=True,
+if not logger.handlers:
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s"
     )
 
+    file_handler = logging.FileHandler(
+        LOG_DIR / "image_generator.log",
+        encoding="utf-8"
+    )
 
-def safe_filename(value):
-    value = str(value).strip().lower()
-    value = re.sub(r"[^\w-]+", "_", value)
-    return value.strip("_")[:70] or "unnamed"
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
 
 
-def get_setting(config, section, key, default):
-    if not isinstance(config, dict):
-        return default
+# ============================================================
+# EXCEPTIONS
+# ============================================================
+
+class ImageRateLimitError(Exception):
+    """Raised when OpenRouter returns HTTP 429."""
+
+
+class ImageGenerationError(Exception):
+    """Raised when image generation fails."""
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def safe_filename(value, max_length=70):
+
+    value = str(value or "").strip().lower()
+
+    value = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        value
+    )
+
+    value = value.strip("_")
+
+    if not value:
+        value = "asset"
+
+    return value[:max_length]
+
+
+def get_setting(config, section, key, default=None):
 
     section_data = config.get(section, {})
+
     if not isinstance(section_data, dict):
         return default
 
     return section_data.get(key, default)
 
 
-def as_text(value, default=""):
+def as_text(value):
+
     if value is None:
-        return default
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
+        return ""
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, (int, float)):
+        return str(value)
+
     return str(value).strip()
 
 
 def as_name_list(value):
-    if value is None:
-        return []
-    if isinstance(value, (str, dict)):
-        value = [value]
+
     if not isinstance(value, list):
         return []
 
-    names = []
+    result = []
+
     for item in value:
+
         if isinstance(item, dict):
-            name = item.get("name", "")
+
+            name = (
+                item.get("name")
+                or item.get("character_name")
+                or item.get("location_name")
+                or item.get("entity_name")
+            )
+
         else:
             name = item
-        name = str(name).strip()
-        if name:
-            names.append(name)
-    return names
+
+        name = as_text(name)
+
+        if name and name not in result:
+            result.append(name)
+
+    return result
 
 
-def clean_generated_folders():
-    """Remove generated image folders from previous runs only."""
-    folders = [
-        SCENE_DIR,
+def positive_int_setting(
+    config,
+    section,
+    key,
+    default,
+    minimum=1,
+    maximum=100
+):
+
+    value = get_setting(
+        config,
+        section,
+        key,
+        default
+    )
+
+    try:
+        value = int(value)
+
+    except (TypeError, ValueError):
+        value = default
+
+    return max(
+        minimum,
+        min(value, maximum)
+    )
+
+
+def ensure_directories():
+
+    directories = [
+        OUTPUT_DIR,
+        ASSET_DIR,
         CHARACTER_DIR,
         LOCATION_DIR,
         ENTITY_DIR,
+        SCENE_ASSET_DIR,
+        IMAGE_DIR,
+        STAGING_DIR,
+        LOG_DIR,
     ]
 
-    for folder in folders:
-        if folder.exists():
-            shutil.rmtree(folder)
-        folder.mkdir(parents=True, exist_ok=True)
-
-    LOGGER.info("Previous generated image folders cleaned.")
-
-
-def load_analysis():
-    if not ANALYSIS_PATH.exists():
-        raise FileNotFoundError(
-            f"Story analysis not found: {ANALYSIS_PATH}"
+    for directory in directories:
+        directory.mkdir(
+            parents=True,
+            exist_ok=True
         )
 
-    with open(ANALYSIS_PATH, "r", encoding="utf-8") as file:
+    # Preserve nested folders created by utils.py.
+
+    for name in [
+        "poses",
+        "body_parts",
+    ]:
+
+        (CHARACTER_DIR / name).mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+    for name in [
+        "backgrounds",
+        "midgrounds",
+        "foregrounds",
+    ]:
+
+        (SCENE_ASSET_DIR / name).mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+
+# ============================================================
+# STORY ANALYSIS
+# ============================================================
+
+def load_analysis():
+
+    if not ANALYSIS_FILE.exists():
+
+        raise FileNotFoundError(
+            f"Story analysis not found: {ANALYSIS_FILE}"
+        )
+
+    with open(
+        ANALYSIS_FILE,
+        "r",
+        encoding="utf-8"
+    ) as file:
+
         analysis = json.load(file)
 
     if not isinstance(analysis, dict):
-        raise ValueError("Story analysis must be a JSON object.")
+
+        raise ValueError(
+            "story_analysis.json must contain a JSON object."
+        )
 
     scenes = analysis.get("scenes")
+
     if not isinstance(scenes, list) or not scenes:
+
         raise ValueError(
-            "Story analysis must contain a non-empty scenes list."
+            "No valid scenes found in story_analysis.json."
         )
 
-    valid_scenes = [scene for scene in scenes if isinstance(scene, dict)]
-    if not valid_scenes:
-        raise ValueError(
-            "Story analysis contains no valid scene objects."
-        )
-
-    analysis["scenes"] = valid_scenes
     return analysis
 
 
 def get_api_key():
-    key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not key:
-        raise ValueError(
-            "OPENROUTER_API_KEY is missing. "
-            "Check GitHub Repository Secrets and workflow env."
+
+    api_key = os.getenv("OPENROUTER_API_KEY")
+
+    if not api_key or len(api_key.strip()) < 10:
+
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is missing or invalid."
         )
-    return key
+
+    return api_key.strip()
 
 
-def positive_int_setting(config, section, key, default, minimum=1, maximum=10):
-    raw_value = get_setting(config, section, key, default)
-    try:
-        value = int(raw_value)
-    except (TypeError, ValueError):
-        LOGGER.warning(
-            "Invalid %s.%s=%r; using %s.",
-            section,
-            key,
-            raw_value,
-            default,
-        )
-        value = default
-
-    return max(minimum, min(value, maximum))
-
+# ============================================================
+# CONTINUITY HELPERS
+# ============================================================
 
 def build_reference_maps(analysis):
-    """Build text descriptions for character, location and entity continuity."""
-    maps = {
-        "characters": {},
-        "locations": {},
-        "entities": {},
-    }
 
-    for collection_name in maps:
-        items = analysis.get(collection_name, [])
-        if not isinstance(items, list):
-            continue
+    characters = {}
+    locations = {}
+    entities = {}
 
-        for item in items:
-            if not isinstance(item, dict):
-                continue
+    for item in analysis.get("characters", []):
+
+        if isinstance(item, dict):
 
             name = as_text(item.get("name"))
+
             if name:
-                maps[collection_name][name.casefold()] = item
+                characters[name] = item
 
-    return maps
+    for item in analysis.get("locations", []):
+
+        if isinstance(item, dict):
+
+            name = as_text(item.get("name"))
+
+            if name:
+                locations[name] = item
+
+    for item in analysis.get("entities", []):
+
+        if isinstance(item, dict):
+
+            name = as_text(item.get("name"))
+
+            if name:
+                entities[name] = item
+
+    return characters, locations, entities
 
 
-def describe_character(item):
-    return (
-        f"Name: {as_text(item.get('name'), 'Unknown')}. "
-        f"Age: {as_text(item.get('age'), 'Not specified')}. "
-        f"Appearance: {as_text(item.get('appearance'))}. "
-        f"Clothing: {as_text(item.get('clothing'))}. "
-        f"Personality: {as_text(item.get('personality'))}. "
-        f"Visual continuity: "
-        f"{as_text(item.get('visual_consistency_notes'))}."
-    )
+def describe_character(name, characters):
 
+    data = characters.get(name, {})
 
-def get_scene_continuity(scene, analysis, reference_maps):
+    if not isinstance(data, dict):
+        return ""
+
+    fields = [
+        "description",
+        "appearance",
+        "visual_description",
+        "clothing",
+        "personality",
+        "age",
+    ]
+
     details = []
 
-    for name in as_name_list(scene.get("characters_present")):
-        character = reference_maps["characters"].get(name.casefold())
-        if character:
-            details.append(
-                "CHARACTER CONTINUITY: " + describe_character(character)
-            )
-        else:
-            details.append(
-                f"CHARACTER: {name}. Preserve the established appearance "
-                "from previous scenes."
-            )
+    for field in fields:
 
-    location_value = scene.get("location", "")
-    if isinstance(location_value, dict):
-        location_name = as_text(location_value.get("name"))
-    else:
-        location_name = as_text(location_value)
+        value = as_text(data.get(field))
 
-    if location_name:
-        location = reference_maps["locations"].get(
-            location_name.casefold()
-        )
-        if location:
-            details.append(
-                "LOCATION CONTINUITY: "
-                f"Name: {as_text(location.get('name'), location_name)}. "
-                f"Description: {as_text(location.get('description'))}. "
-                f"Atmosphere: {as_text(location.get('atmosphere'))}. "
-                f"Lighting: {as_text(location.get('lighting'))}. "
-                f"Visual notes: "
-                f"{as_text(location.get('visual_consistency_notes'))}."
-            )
-        else:
-            details.append(
-                f"LOCATION: {location_name}. Keep its appearance "
-                "consistent with earlier scenes."
-            )
+        if value:
+            details.append(value)
 
-    for name in as_name_list(scene.get("entities_present")):
-        entity = reference_maps["entities"].get(name.casefold())
-        if entity:
-            details.append(
-                "ENTITY CONTINUITY: "
-                f"Name: {as_text(entity.get('name'), name)}. "
-                f"Description: {as_text(entity.get('description'))}. "
-                f"Behavior: {as_text(entity.get('behavior'))}. "
-                f"Visual notes: "
-                f"{as_text(entity.get('visual_consistency_notes'))}."
-            )
-        else:
-            details.append(
-                f"ENTITY: {name}. Preserve its previously established "
-                "appearance and supernatural characteristics."
-            )
-
-    return "\n".join(details)
+    return ", ".join(details)
 
 
-def build_prompt(category, item, analysis=None, reference_maps=None):
-    analysis = analysis if isinstance(analysis, dict) else {}
-    item = item if isinstance(item, dict) else {}
-    reference_maps = reference_maps or build_reference_maps(analysis)
+def get_scene_continuity(scene, characters, locations):
 
-    if category == "character":
-        return f"""
-Create a professional CHARACTER REFERENCE IMAGE
-for a cinematic Hindi horror film.
-
-CHARACTER NAME: {as_text(item.get('name'), 'Unknown')}
-AGE: {as_text(item.get('age'), 'Not specified')}
-APPEARANCE: {as_text(item.get('appearance'))}
-CLOTHING: {as_text(item.get('clothing'))}
-PERSONALITY: {as_text(item.get('personality'))}
-ROLE: {as_text(item.get('role'))}
-CONTINUITY: {as_text(item.get('visual_consistency_notes'))}
-
-Show one clean character reference composition with
-full-body front view, three-quarter view and side profile.
-Keep facial identity, body proportions, hairstyle and
-clothing consistent in every view.
-
-Visual style: {STYLE}
-"""
-
-    if category == "location":
-        return f"""
-Create a cinematic LOCATION REFERENCE IMAGE.
-
-LOCATION: {as_text(item.get('name'), 'Unknown')}
-DESCRIPTION: {as_text(item.get('description'))}
-ATMOSPHERE: {as_text(item.get('atmosphere'))}
-LIGHTING: {as_text(item.get('lighting'))}
-CONTINUITY: {as_text(item.get('visual_consistency_notes'))}
-
-Show a detailed establishing view.
-Preserve architecture, geography, weather and lighting.
-
-Visual style: {STYLE}
-"""
-
-    if category == "entity":
-        return f"""
-Create a cinematic SUPERNATURAL ENTITY REFERENCE IMAGE.
-
-ENTITY: {as_text(item.get('name'), 'Unknown')}
-DESCRIPTION: {as_text(item.get('description'))}
-BEHAVIOR: {as_text(item.get('behavior'))}
-CONTINUITY: {as_text(item.get('visual_consistency_notes'))}
-
-Create a frightening but visually coherent entity.
-Preserve its physical characteristics, face, clothing,
-body proportions and supernatural details.
-
-Visual style: {STYLE}
-"""
-
-    if category == "scene":
-        continuity = get_scene_continuity(
-            item,
-            analysis,
-            reference_maps,
-        )
-        characters = ", ".join(as_name_list(item.get("characters_present")))
-        location = item.get("location", "")
-        if isinstance(location, dict):
-            location = location.get("name", "")
-
-        return f"""
-Create ONE cinematic widescreen still image
-for a professional Hindi horror movie.
-
-STORY TITLE:
-{as_text(analysis.get('title'), 'Horror Story')}
-
-SCENE NUMBER:
-{as_text(item.get('scene_number'))}
-
-STORY EVENT:
-{as_text(item.get('story_event'))}
-
-VISUAL DESCRIPTION:
-{as_text(item.get('visual_description'))}
-
-CHARACTERS PRESENT:
-{characters}
-
-LOCATION:
-{as_text(location)}
-
-CAMERA ANGLE:
-{as_text(item.get('camera_angle'))}
-
-LIGHTING:
-{as_text(item.get('lighting'))}
-
-ATMOSPHERE:
-{as_text(item.get('atmosphere'))}
-
-VISUAL CONTINUITY DETAILS:
-{continuity}
-
-ADDITIONAL SCENE NOTES:
-{as_text(item.get('visual_consistency_notes'))}
-
-STRICT RULES:
-- Follow the original story event exactly.
-- Do not invent characters or events.
-- Do not change character identities or clothing.
-- Maintain the same faces and physical appearances
-  wherever characters return.
-- Maintain location architecture and geography.
-- Do not combine multiple story moments.
-- Show one cinematic film frame only.
-- Do not add written text or subtitles in the image.
-
-Visual style: {STYLE}
-"""
-
-    raise ValueError(f"Unknown image category: {category}")
-
-
-def save_generated_image(image_bytes, output_path):
-    """Decode, validate and atomically save a generated image as PNG."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_name(
-        output_path.stem + ".tmp" + output_path.suffix
+    character_names = as_name_list(
+        scene.get("characters", [])
     )
 
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            image.load()
+    location_name = as_text(
+        scene.get("location")
+        or scene.get("location_name")
+    )
 
-            if image.width < 256 or image.height < 256:
-                raise ValueError(
-                    f"Image resolution too small: "
-                    f"{image.width}x{image.height}"
+    character_details = []
+
+    for name in character_names:
+
+        description = describe_character(
+            name,
+            characters
+        )
+
+        if description:
+
+            character_details.append(
+                f"{name}: {description}"
+            )
+
+    location_details = ""
+
+    if location_name:
+
+        location_data = locations.get(
+            location_name,
+            {}
+        )
+
+        if isinstance(location_data, dict):
+
+            location_details = (
+                as_text(location_data.get("description"))
+                or as_text(location_data.get("visual_description"))
+            )
+
+    return (
+        character_names,
+        location_name,
+        character_details,
+        location_details
+    )
+
+
+# ============================================================
+# VISUAL STYLE
+# ============================================================
+
+VISUAL_STYLE = """
+Premium cinematic 2D illustrated documentary animation.
+
+Visual identity:
+- Deep dark navy #071426.
+- Steel blue #162C45.
+- Crimson red #8F1728.
+- Warm beige #D5BDA0.
+- Professional graphic novel illustration.
+- Semi-realistic hand-painted 2D artwork.
+- Detailed ink outlines.
+- Cinematic lighting.
+- Rich environmental detail.
+- Natural human anatomy.
+- Realistic body proportions.
+- Strong foreground and background separation.
+- Controlled dramatic shadows.
+- Atmospheric depth.
+- Documentary storytelling composition.
+
+Avoid:
+- 3D CGI.
+- Plastic 3D characters.
+- Toy-like characters.
+- Chibi style.
+- Cute cartoon style.
+- Photorealistic photography.
+- Watermarks.
+- Logos.
+- Random text.
+- Unwanted typography.
+- Distorted hands.
+- Extra fingers.
+- Deformed faces.
+"""
+
+
+NEGATIVE_STYLE = """
+No 3D rendering, no photorealistic image,
+no glossy plastic skin, no toy appearance,
+no anime exaggeration, no chibi,
+no distorted anatomy, no extra limbs,
+no random letters, no watermark,
+no logo, no blurry faces.
+"""
+
+
+# ============================================================
+# PROMPT GENERATION
+# ============================================================
+
+def build_character_prompt(name, data):
+
+    description = describe_character(
+        name,
+        {name: data}
+    )
+
+    if not description:
+        description = "A cinematic documentary character."
+
+    return f"""
+Create a professional character reference sheet
+for a cinematic 2D animated documentary.
+
+CHARACTER NAME:
+{name}
+
+CHARACTER DESCRIPTION:
+{description}
+
+Required views:
+1. Full body front view.
+2. Full body three-quarter view.
+3. Full body side view.
+
+All three views must depict exactly the same person.
+
+Keep consistent:
+- Face.
+- Hairstyle.
+- Skin tone.
+- Body proportions.
+- Clothing.
+- Accessories.
+- Age.
+- Character identity.
+
+Neutral standing pose.
+Full body visible.
+Arms slightly separated from torso.
+Clear silhouette.
+Plain neutral background.
+Professional character design sheet.
+
+{VISUAL_STYLE}
+
+{NEGATIVE_STYLE}
+"""
+
+
+def build_pose_prompt(name, data, pose):
+
+    description = describe_character(
+        name,
+        {name: data}
+    )
+
+    pose_descriptions = {
+
+        "standing":
+            "Neutral full-body standing pose.",
+
+        "walking":
+            "Natural walking pose, one leg forward.",
+
+        "running":
+            "Dynamic running pose with natural body balance.",
+
+        "looking_back":
+            "Standing pose with head turned backward.",
+
+        "sitting":
+            "Natural seated pose.",
+
+        "gesture":
+            "Natural expressive hand gesture.",
+    }
+
+    action = pose_descriptions.get(
+        pose,
+        "Natural full-body documentary pose."
+    )
+
+    return f"""
+Create a separate full-body 2D character pose asset.
+
+Character:
+{name}
+
+Character identity:
+{description}
+
+Pose:
+{action}
+
+Important:
+The character must remain visually identical
+to the supplied character description.
+
+Full body visible.
+Clear silhouette.
+Arms and legs clearly separated where possible.
+Neutral simple background.
+No extra characters.
+No captions.
+No text.
+
+{VISUAL_STYLE}
+
+{NEGATIVE_STYLE}
+"""
+
+
+def build_location_prompt(name, data):
+
+    description = (
+        as_text(data.get("description"))
+        or as_text(data.get("visual_description"))
+        or name
+    )
+
+    return f"""
+Create a cinematic 2D illustrated environment
+reference image for a documentary animation.
+
+LOCATION:
+{name}
+
+ENVIRONMENT:
+{description}
+
+Composition:
+Wide establishing view.
+Detailed architecture.
+Strong depth separation.
+Clear foreground.
+Detailed midground.
+Atmospheric background.
+Cinematic lighting.
+No people unless essential to the location.
+
+{VISUAL_STYLE}
+
+{NEGATIVE_STYLE}
+"""
+
+
+def build_entity_prompt(name, data):
+
+    description = (
+        as_text(data.get("description"))
+        or as_text(data.get("visual_description"))
+        or name
+    )
+
+    return f"""
+Create a detailed 2D illustrated prop reference
+for a cinematic documentary animation.
+
+OBJECT:
+{name}
+
+DESCRIPTION:
+{description}
+
+Show the object clearly.
+Centered composition.
+Readable silhouette.
+Detailed material and surface.
+Simple neutral background.
+No unrelated objects.
+No text.
+
+{VISUAL_STYLE}
+
+{NEGATIVE_STYLE}
+"""
+
+
+def build_scene_prompt(
+    scene,
+    characters,
+    locations,
+    entities
+):
+
+    scene_number = scene.get(
+        "scene_number",
+        scene.get("number", "unknown")
+    )
+
+    description = (
+        as_text(scene.get("visual_description"))
+        or as_text(scene.get("description"))
+        or as_text(scene.get("story_event"))
+    )
+
+    narration = as_text(
+        scene.get("narration")
+        or scene.get("voiceover")
+    )
+
+    character_names = as_name_list(
+        scene.get("characters", [])
+    )
+
+    location_name = as_text(
+        scene.get("location")
+        or scene.get("location_name")
+    )
+
+    (
+        character_names,
+        location_name,
+        character_details,
+        location_details
+    ) = get_scene_continuity(
+        scene,
+        characters,
+        locations
+    )
+
+    entity_names = as_name_list(
+        scene.get("entities", [])
+    )
+
+    entity_details = []
+
+    for name in entity_names:
+
+        data = entities.get(name, {})
+
+        if isinstance(data, dict):
+
+            detail = (
+                as_text(data.get("description"))
+                or as_text(data.get("visual_description"))
+            )
+
+            if detail:
+                entity_details.append(
+                    f"{name}: {detail}"
                 )
 
-            if image.width <= 0 or image.height <= 0:
-                raise ValueError("Image has invalid dimensions.")
+    return f"""
+Create one cinematic 2D illustrated documentary scene.
 
-            rgb_image = image.convert("RGB")
-            rgb_image.save(temporary_path, format="PNG")
+SCENE NUMBER:
+{scene_number}
 
-        # Verify the written file can be opened before making it final.
-        with Image.open(temporary_path) as check_image:
-            check_image.verify()
+STORY EVENT:
+{description}
 
-        temporary_path.replace(output_path)
+NARRATION CONTEXT:
+{narration[:1200]}
 
-    except (UnidentifiedImageError, OSError, ValueError) as error:
-        if temporary_path.exists():
-            temporary_path.unlink()
-        raise ValueError(
-            f"Returned image could not be decoded or saved: {error}"
-        ) from error
-    except Exception:
-        if temporary_path.exists():
-            temporary_path.unlink()
-        raise
+CHARACTERS:
+{", ".join(character_names) or "No specific character"}
 
-    LOGGER.info("Image saved: %s", output_path)
-    return str(output_path)
+CHARACTER VISUAL DETAILS:
+{"; ".join(character_details)}
 
+LOCATION:
+{location_name}
+
+LOCATION DETAILS:
+{location_details}
+
+IMPORTANT OBJECTS:
+{"; ".join(entity_details)}
+
+VISUAL DIRECTION:
+
+Create a carefully composed cinematic frame.
+The scene must visually communicate the story event.
+Use expressive but natural character poses.
+Maintain consistent character identity.
+Maintain consistent clothing and environment.
+Use dramatic documentary lighting.
+Create clear foreground, midground and background depth.
+
+Composition must be suitable for later 2D cut-out animation
+and layered parallax movement.
+
+Keep important subjects away from extreme frame edges.
+Use a widescreen 16:9 composition.
+No captions.
+No typography.
+No watermarks.
+
+{VISUAL_STYLE}
+
+{NEGATIVE_STYLE}
+"""
+
+
+# ============================================================
+# ANIMATION METADATA
+# ============================================================
+
+def build_animation_metadata(scene):
+
+    description = (
+        as_text(scene.get("visual_description"))
+        or as_text(scene.get("description"))
+        or as_text(scene.get("story_event"))
+    )
+
+    text = description.lower()
+
+    camera_motion = "slow_push_in"
+
+    if any(
+        word in text
+        for word in [
+            "walking",
+            "running",
+            "chasing",
+            "moving",
+            "traveling",
+        ]
+    ):
+
+        camera_motion = "tracking"
+
+    elif any(
+        word in text
+        for word in [
+            "city",
+            "building",
+            "landscape",
+            "street",
+            "location",
+        ]
+    ):
+
+        camera_motion = "slow_pan"
+
+    elif any(
+        word in text
+        for word in [
+            "reveal",
+            "secret",
+            "discovery",
+            "evidence",
+        ]
+    ):
+
+        camera_motion = "dramatic_reveal"
+
+    return {
+
+        "animation_engine": "hybrid_2d_cutout",
+
+        "scene_type": "cinematic_2d_documentary",
+
+        "camera_motion": camera_motion,
+
+        "layers_required": [
+            "background",
+            "midground",
+            "character",
+            "foreground",
+            "atmosphere",
+            "overlay",
+        ],
+
+        "effects": [
+            "subtle_parallax",
+            "film_grain",
+            "cinematic_vignette",
+        ],
+
+        "character_animation": {
+            "idle_breathing": True,
+            "head_movement": True,
+            "eye_blink": True,
+            "arm_gestures": False,
+            "body_movement": False,
+            "requires_separate_pose_assets": True,
+        },
+
+        "source_image_is_flat": True,
+
+        "full_rig_available": False,
+    }
+
+
+# ============================================================
+# RETRY HANDLING
+# ============================================================
 
 def get_retry_after_seconds(headers):
+
     if not headers:
         return None
 
     value = headers.get("Retry-After")
+
     if not value:
         return None
 
     try:
-        return max(1, min(int(float(value)), 180))
+
+        return max(
+            0,
+            float(value)
+        )
+
     except (TypeError, ValueError):
         pass
 
     try:
-        retry_date = email.utils.parsedate_to_datetime(value)
+
+        retry_date = email.utils.parsedate_to_datetime(
+            value
+        )
+
         if retry_date.tzinfo is None:
-            retry_date = retry_date.replace(tzinfo=timezone.utc)
-        seconds = (retry_date - datetime.now(timezone.utc)).total_seconds()
-        return max(1, min(int(seconds), 180))
-    except (TypeError, ValueError, OverflowError):
+
+            retry_date = retry_date.replace(
+                tzinfo=timezone.utc
+            )
+
+        return max(
+            0,
+            (
+                retry_date
+                - datetime.now(timezone.utc)
+            ).total_seconds()
+        )
+
+    except Exception:
         return None
 
 
-def generate_image(
-    prompt,
-    output_path,
-    aspect_ratio="16:9",
-    max_retries=3,
-    retry_delay=15,
-):
-    api_key = get_api_key()
+def get_retry_delay(attempt):
+
+    return min(
+        5 * (2 ** attempt),
+        60
+    )
+
+
+# ============================================================
+# IMAGE VALIDATION AND SAVING
+# ============================================================
+
+def validate_image_bytes(image_bytes):
+
+    if not image_bytes:
+        raise ImageGenerationError(
+            "Empty image data received."
+        )
 
     try:
-        max_retries = max(1, min(int(max_retries), 5))
-        retry_delay = max(1, min(int(retry_delay), 120))
-    except (TypeError, ValueError):
-        max_retries = 3
-        retry_delay = 15
 
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("Image prompt cannot be empty.")
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        )
 
-    payload = {
-        "model": IMAGE_MODEL,
-        "prompt": prompt.strip(),
-        "aspect_ratio": str(aspect_ratio or "16:9"),
-        "n": 1,
-    }
+        image.verify()
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/",
-        "X-Title": "Horror Story Automation",
-    }
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        )
 
-    request_data = json.dumps(payload).encode("utf-8")
+        width, height = image.size
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            LOGGER.info(
-                "Generating %s (attempt %s/%s, model=%s)",
-                output_path,
-                attempt,
-                max_retries,
-                IMAGE_MODEL,
+        if width < MIN_IMAGE_SIZE:
+            raise ImageGenerationError(
+                f"Image width too small: {width}"
             )
 
-            request = urllib.request.Request(
-                IMAGE_API_URL,
-                data=request_data,
-                headers=headers,
-                method="POST",
+        if height < MIN_IMAGE_SIZE:
+            raise ImageGenerationError(
+                f"Image height too small: {height}"
             )
 
-            with urllib.request.urlopen(request, timeout=180) as response:
-                raw_body = response.read()
-
-            try:
-                result = json.loads(raw_body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise RuntimeError(
-                    f"OpenRouter returned invalid JSON: {error}"
-                ) from error
-
-            if not isinstance(result, dict):
-                raise RuntimeError("OpenRouter response was not a JSON object.")
-
-            images = result.get("data")
-            if not isinstance(images, list) or not images:
-                raise RuntimeError(
-                    "OpenRouter response did not contain a non-empty data array."
-                )
-
-            first_image = images[0]
-            if not isinstance(first_image, dict):
-                raise RuntimeError("OpenRouter image data was malformed.")
-
-            encoded_image = first_image.get("b64_json")
-            if not isinstance(encoded_image, str) or not encoded_image.strip():
-                raise RuntimeError(
-                    "OpenRouter response did not contain data[0].b64_json."
-                )
-
-            try:
-                image_bytes = base64.b64decode(
-                    encoded_image,
-                    validate=True,
-                )
-            except (ValueError, base64.binascii.Error) as error:
-                raise RuntimeError(
-                    f"OpenRouter returned invalid base64 image data: {error}"
-                ) from error
-
-            if not image_bytes:
-                raise RuntimeError("OpenRouter returned an empty image.")
-
-            return save_generated_image(image_bytes, output_path)
-
-        except urllib.error.HTTPError as error:
-            error_body = error.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-            error_message = error_body[:1000]
-
-            LOGGER.error(
-                "OpenRouter HTTP error %s: %s",
-                error.code,
-                error_message,
+        if width > MAX_IMAGE_DIMENSION:
+            raise ImageGenerationError(
+                f"Image width too large: {width}"
             )
 
-            if error.code == 429:
-                retry_after = get_retry_after_seconds(error.headers)
-                suffix = (
-                    f" Retry-After: {retry_after}s."
-                    if retry_after else ""
-                )
-                raise ImageRateLimitError(
-                    f"HTTP 429 rate limit reached: {error_message}{suffix}"
-                ) from error
-
-            if error.code in NON_RETRYABLE_HTTP_CODES:
-                raise RuntimeError(
-                    f"OpenRouter rejected the request: "
-                    f"HTTP {error.code}. {error_message}"
-                ) from error
-
-            if error.code not in RETRYABLE_HTTP_CODES or attempt == max_retries:
-                raise RuntimeError(
-                    f"OpenRouter image request failed: "
-                    f"HTTP {error.code}. {error_message}"
-                ) from error
-
-            wait_time = get_retry_after_seconds(error.headers)
-            if wait_time is None:
-                wait_time = min(retry_delay * attempt, 120)
-
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
-            LOGGER.warning(
-                "Temporary image API connection error (attempt %s/%s): %s",
-                attempt,
-                max_retries,
-                error,
+        if height > MAX_IMAGE_DIMENSION:
+            raise ImageGenerationError(
+                f"Image height too large: {height}"
             )
-            if attempt == max_retries:
-                raise RuntimeError(
-                    f"Image API connection failed after {max_retries} attempts: "
-                    f"{error}"
-                ) from error
-            wait_time = min(retry_delay * attempt, 120)
 
-        except (RuntimeError, ValueError) as error:
-            # Invalid requests/data are not likely to improve by retrying.
-            # Only malformed/empty provider responses are retried once.
-            message = str(error).lower()
-            retryable_response_error = (
-                "invalid json" in message
-                or "did not contain" in message
-                or "malformed" in message
-            )
-            if not retryable_response_error or attempt == max_retries:
-                raise
-            wait_time = min(retry_delay * attempt, 120)
+        return image
 
-        LOGGER.info("Retrying image request after %s seconds.", wait_time)
-        time.sleep(wait_time)
+    except (
+        UnidentifiedImageError,
+        OSError
+    ) as error:
 
-    raise RuntimeError(f"Image generation failed: {output_path}")
+        raise ImageGenerationError(
+            f"Invalid image data: {error}"
+        ) from error
 
 
-def generate_references(analysis, config):
-    references = {
-        "characters": {},
-        "locations": {},
-        "entities": {},
-    }
-    failures = []
+def save_generated_image(image_bytes, destination):
 
-    collections = [
-        ("characters", CHARACTER_DIR, "character"),
-        ("locations", LOCATION_DIR, "location"),
-        ("entities", ENTITY_DIR, "entity"),
-    ]
+    destination = Path(destination)
+
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    image = validate_image_bytes(
+        image_bytes
+    )
+
+    # Preserve transparency if the provider returns it.
+    if image.mode in ("RGBA", "LA"):
+        output_image = image.convert("RGBA")
+
+    elif image.mode == "P" and "transparency" in image.info:
+        output_image = image.convert("RGBA")
+
+    else:
+        output_image = image.convert("RGB")
+
+    temporary_file = destination.with_suffix(
+        destination.suffix + ".tmp"
+    )
+
+    try:
+
+        output_image.save(
+            temporary_file,
+            format="PNG",
+            optimize=True
+        )
+
+        with Image.open(temporary_file) as check:
+
+            check.verify()
+
+        os.replace(
+            temporary_file,
+            destination
+        )
+
+    finally:
+
+        if temporary_file.exists():
+            temporary_file.unlink()
+
+    return str(destination)
+
+
+# ============================================================
+# OPENROUTER IMAGE GENERATION
+# ============================================================
+
+def generate_image(
+    prompt,
+    destination,
+    api_key,
+    config
+):
 
     max_retries = positive_int_setting(
-        config, "generation", "max_retries", 3, 1, 5
+        config,
+        "generation",
+        "max_retries",
+        3,
+        1,
+        5
     )
+
     retry_delay = positive_int_setting(
-        config, "generation", "retry_delay_seconds", 15, 1, 120
+        config,
+        "generation",
+        "retry_delay_seconds",
+        5,
+        1,
+        60
     )
-    aspect_ratio = get_setting(config, "images", "aspect_ratio", "16:9")
+
+    timeout = positive_int_setting(
+        config,
+        "generation",
+        "image_timeout_seconds",
+        DEFAULT_TIMEOUT,
+        30,
+        300
+    )
+
+    image_settings = config.get(
+        "images",
+        {}
+    )
+
+    aspect_ratio = (
+        image_settings.get("aspect_ratio")
+        or "16:9"
+    )
+
+    payload = {
+
+        "model": OPENROUTER_IMAGE_MODEL,
+
+        "prompt": prompt,
+
+        "n": 1,
+
+        "aspect_ratio": aspect_ratio,
+    }
+
+    request_data = json.dumps(
+        payload
+    ).encode("utf-8")
+
+    headers = {
+
+        "Authorization": f"Bearer {api_key}",
+
+        "Content-Type": "application/json",
+
+        "HTTP-Referer": "https://github.com/",
+
+        "X-Title": "Cinematic 2D Horror Automation",
+    }
+
+    request = urllib.request.Request(
+        IMAGE_API_URL,
+        data=request_data,
+        headers=headers,
+        method="POST"
+    )
+
+    for attempt in range(max_retries):
+
+        try:
+
+            logger.info(
+                "Generating image using %s",
+                OPENROUTER_IMAGE_MODEL
+            )
+
+            with urllib.request.urlopen(
+                request,
+                timeout=timeout
+            ) as response:
+
+                response_body = response.read()
+
+            result = json.loads(
+                response_body.decode("utf-8")
+            )
+
+            data = result.get("data", [])
+
+            if not data:
+
+                raise ImageGenerationError(
+                    "Provider returned no image data."
+                )
+
+            image_item = data[0]
+
+            encoded_image = image_item.get(
+                "b64_json"
+            )
+
+            if not encoded_image:
+
+                raise ImageGenerationError(
+                    "Provider response does not contain b64_json."
+                )
+
+            image_bytes = base64.b64decode(
+                encoded_image,
+                validate=True
+            )
+
+            return save_generated_image(
+                image_bytes,
+                destination
+            )
+
+        except urllib.error.HTTPError as error:
+
+            status = error.code
+
+            response_text = ""
+
+            try:
+                response_text = error.read().decode(
+                    "utf-8",
+                    errors="replace"
+                )
+
+            except Exception:
+                pass
+
+            logger.error(
+                "OpenRouter HTTP %s: %s",
+                status,
+                response_text[:1000]
+            )
+
+            if status == 429:
+
+                retry_after = get_retry_after_seconds(
+                    error.headers
+                )
+
+                raise ImageRateLimitError(
+                    "OpenRouter rate limit reached. "
+                    f"Retry-After: {retry_after}"
+                ) from error
+
+            if status in NON_RETRYABLE_HTTP_CODES:
+                raise ImageGenerationError(
+                    f"Non-retryable HTTP error: {status}"
+                ) from error
+
+            if status not in RETRYABLE_HTTP_CODES:
+                raise ImageGenerationError(
+                    f"Unexpected HTTP error: {status}"
+                ) from error
+
+            if attempt == max_retries - 1:
+                raise ImageGenerationError(
+                    f"Image generation failed after retries: HTTP {status}"
+                ) from error
+
+            delay = get_retry_after_seconds(
+                error.headers
+            )
+
+            if delay is None:
+                delay = max(
+                    retry_delay,
+                    get_retry_delay(attempt)
+                )
+
+            logger.warning(
+                "Retrying after HTTP %s in %.1f seconds",
+                status,
+                delay
+            )
+
+            time.sleep(delay)
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError
+        ) as error:
+
+            if attempt == max_retries - 1:
+
+                raise ImageGenerationError(
+                    f"Network failure: {error}"
+                ) from error
+
+            delay = max(
+                retry_delay,
+                get_retry_delay(attempt)
+            )
+
+            logger.warning(
+                "Network error. Retry in %s seconds: %s",
+                delay,
+                error
+            )
+
+            time.sleep(delay)
+
+        except (
+            json.JSONDecodeError,
+            ValueError,
+            ImageGenerationError
+        ) as error:
+
+            if isinstance(error, ImageGenerationError):
+                raise
+
+            if attempt == max_retries - 1:
+                raise ImageGenerationError(
+                    f"Invalid provider response: {error}"
+                ) from error
+
+            time.sleep(
+                get_retry_delay(attempt)
+            )
+
+    raise ImageGenerationError(
+        "Image generation exhausted all attempts."
+    )
+
+
+# ============================================================
+# ASSET GENERATION
+# ============================================================
+
+def generate_asset(
+    prompt,
+    destination,
+    api_key,
+    config,
+    asset_type,
+    asset_name
+):
+
+    logger.info(
+        "Generating %s asset: %s",
+        asset_type,
+        asset_name
+    )
+
+    try:
+
+        image_path = generate_image(
+            prompt,
+            destination,
+            api_key,
+            config
+        )
+
+        return {
+
+            "name": asset_name,
+
+            "asset_type": asset_type,
+
+            "image_path": image_path,
+
+            "status": "success",
+        }
+
+    except ImageRateLimitError:
+        raise
+
+    except Exception as error:
+
+        logger.exception(
+            "Asset generation failed: %s",
+            asset_name
+        )
+
+        return {
+
+            "name": asset_name,
+
+            "asset_type": asset_type,
+
+            "image_path": None,
+
+            "status": "failed",
+
+            "error": str(error),
+        }
+
+
+def generate_references(
+    analysis,
+    api_key,
+    config,
+    report
+):
+
+    characters, locations, entities = build_reference_maps(
+        analysis
+    )
+
     reference_limit = positive_int_setting(
         config,
         "generation",
         "max_reference_images_per_run",
-        DEFAULT_MAX_REFERENCE_IMAGES_PER_RUN,
-        1,
-        20,
+        DEFAULT_REFERENCE_LIMIT,
+        0,
+        50
     )
 
-    attempted = 0
-    rate_limited = False
+    pose_limit = positive_int_setting(
+        config,
+        "generation",
+        "max_character_poses_per_run",
+        DEFAULT_POSE_LIMIT,
+        0,
+        20
+    )
 
-    for collection_name, folder, category in collections:
-        items = analysis.get(collection_name, [])
-        if not isinstance(items, list):
+    generated_count = 0
+
+    # --------------------------------------------------------
+    # CHARACTER REFERENCES
+    # --------------------------------------------------------
+
+    for name, data in characters.items():
+
+        if generated_count >= reference_limit:
+            break
+
+        destination = (
+            CHARACTER_DIR
+            / f"{safe_filename(name)}_reference.png"
+        )
+
+        result = generate_asset(
+            build_character_prompt(name, data),
+            destination,
+            api_key,
+            config,
+            "character_reference",
+            name
+        )
+
+        report["reference_assets"].append(
+            result
+        )
+
+        if result["status"] == "success":
+            generated_count += 1
+
+        if result["status"] == "failed":
             continue
 
-        for index, item in enumerate(items, start=1):
-            if not isinstance(item, dict):
-                continue
+    # --------------------------------------------------------
+    # CHARACTER POSES
+    # --------------------------------------------------------
 
-            name = as_text(item.get("name")) or f"{category}_{index}"
-            if attempted >= reference_limit or rate_limited:
-                failures.append({
-                    "category": category,
-                    "name": name,
-                    "error": "Reference image skipped due to per-run limit "
-                             "or API rate limit.",
-                })
-                references[collection_name][name] = {
-                    "path": None,
-                    "status": "skipped",
-                }
-                continue
-
-            filename = f"{index:03d}_{safe_filename(name)}.png"
-            output_path = folder / filename
-            attempted += 1
-
-            try:
-                path = generate_image(
-                    prompt=build_prompt(category, item, analysis),
-                    output_path=output_path,
-                    aspect_ratio=aspect_ratio,
-                    max_retries=max_retries,
-                    retry_delay=retry_delay,
-                )
-                references[collection_name][name] = {
-                    "path": path,
-                    "status": "success",
-                }
-
-            except ImageRateLimitError as error:
-                rate_limited = True
-                LOGGER.warning(
-                    "Reference generation stopped by API rate limit: %s",
-                    error,
-                )
-                references[collection_name][name] = {
-                    "path": None,
-                    "status": "failed",
-                    "error": str(error),
-                }
-                failures.append({
-                    "category": category,
-                    "name": name,
-                    "error": str(error),
-                })
-
-            except Exception as error:
-                LOGGER.exception("Reference generation failed: %s", name)
-                references[collection_name][name] = {
-                    "path": None,
-                    "status": "failed",
-                    "error": str(error),
-                }
-                failures.append({
-                    "category": category,
-                    "name": name,
-                    "error": str(error),
-                })
-
-    return references, failures
-
-
-def select_scene_images(scenes, image_count):
-    if not isinstance(scenes, list) or not scenes:
-        raise ValueError("No scenes are available for image generation.")
-
-    try:
-        image_count = int(image_count)
-    except (TypeError, ValueError):
-        raise ValueError("video.image_count must be a valid integer.")
-
-    if image_count <= 0:
-        raise ValueError("video.image_count must be positive.")
-
-    if len(scenes) <= image_count:
-        return scenes
-
-    if image_count == 1:
-        return [scenes[0]]
-
-    indexes = [
-        round(i * (len(scenes) - 1) / (image_count - 1))
-        for i in range(image_count)
+    pose_names = [
+        "standing",
+        "walking",
+        "looking_back",
+        "running",
+        "sitting",
+        "gesture",
     ]
 
-    # Keep indices unique in case rounding produces duplicates.
-    unique_indexes = list(dict.fromkeys(indexes))
-    return [scenes[index] for index in unique_indexes]
+    generated_poses = 0
+
+    for name, data in characters.items():
+
+        for pose in pose_names:
+
+            if generated_poses >= pose_limit:
+                break
+
+            destination = (
+                CHARACTER_DIR
+                / "poses"
+                / f"{safe_filename(name)}_{pose}.png"
+            )
+
+            result = generate_asset(
+                build_pose_prompt(
+                    name,
+                    data,
+                    pose
+                ),
+                destination,
+                api_key,
+                config,
+                "character_pose",
+                f"{name}_{pose}"
+            )
+
+            report["pose_assets"].append(
+                result
+            )
+
+            if result["status"] == "success":
+                generated_poses += 1
+
+        if generated_poses >= pose_limit:
+            break
+
+    # --------------------------------------------------------
+    # LOCATION REFERENCES
+    # --------------------------------------------------------
+
+    for name, data in locations.items():
+
+        if generated_count >= reference_limit:
+            break
+
+        destination = (
+            LOCATION_DIR
+            / f"{safe_filename(name)}_reference.png"
+        )
+
+        result = generate_asset(
+            build_location_prompt(name, data),
+            destination,
+            api_key,
+            config,
+            "location_reference",
+            name
+        )
+
+        report["reference_assets"].append(
+            result
+        )
+
+        if result["status"] == "success":
+            generated_count += 1
+
+    # --------------------------------------------------------
+    # ENTITY REFERENCES
+    # --------------------------------------------------------
+
+    for name, data in entities.items():
+
+        if generated_count >= reference_limit:
+            break
+
+        destination = (
+            ENTITY_DIR
+            / f"{safe_filename(name)}_reference.png"
+        )
+
+        result = generate_asset(
+            build_entity_prompt(name, data),
+            destination,
+            api_key,
+            config,
+            "entity_reference",
+            name
+        )
+
+        report["reference_assets"].append(
+            result
+        )
+
+        if result["status"] == "success":
+            generated_count += 1
 
 
-def generate_scene_images(analysis, config):
-    scenes = analysis["scenes"]
+# ============================================================
+# SCENE SELECTION
+# ============================================================
 
-    configured_image_count = int(
-        get_setting(config, "video", "image_count", 96)
+def select_scene_images(scenes, image_count):
+
+    if image_count >= len(scenes):
+        return list(enumerate(scenes))
+
+    if image_count <= 0:
+        return []
+
+    if image_count == 1:
+        return [(0, scenes[0])]
+
+    selected_indexes = []
+
+    for index in range(image_count):
+
+        position = round(
+            index * (len(scenes) - 1)
+            / (image_count - 1)
+        )
+
+        if position not in selected_indexes:
+            selected_indexes.append(position)
+
+    return [
+        (index, scenes[index])
+        for index in selected_indexes
+    ]
+
+
+# ============================================================
+# SCENE IMAGE GENERATION
+# ============================================================
+
+def generate_scene_images(
+    analysis,
+    api_key,
+    config,
+    report
+):
+
+    scenes = analysis.get(
+        "scenes",
+        []
     )
-    per_run_limit = positive_int_setting(
+
+    characters, locations, entities = build_reference_maps(
+        analysis
+    )
+
+    configured_image_count = positive_int_setting(
+        config,
+        "video",
+        "image_count",
+        len(scenes),
+        1,
+        500
+    )
+
+    max_scene_images = positive_int_setting(
         config,
         "generation",
         "max_scene_images_per_run",
-        DEFAULT_MAX_SCENE_IMAGES_PER_RUN,
+        DEFAULT_SCENE_LIMIT,
         1,
-        200,
+        500
     )
 
-    effective_image_count = min(configured_image_count, per_run_limit)
-    selected_scenes = select_scene_images(scenes, effective_image_count)
+    target_count = min(
+        configured_image_count,
+        max_scene_images,
+        len(scenes)
+    )
 
-    if configured_image_count > per_run_limit:
-        LOGGER.warning(
-            "Scene image request capped from %s to %s this run. "
-            "Change generation.max_scene_images_per_run to override.",
-            configured_image_count,
-            per_run_limit,
+    selected_scenes = select_scene_images(
+        scenes,
+        target_count
+    )
+
+    logger.info(
+        "Generating %s scene images out of %s scenes.",
+        len(selected_scenes),
+        len(scenes)
+    )
+
+    for image_index, (scene_index, scene) in enumerate(
+        selected_scenes,
+        start=1
+    ):
+
+        scene_number = scene.get(
+            "scene_number",
+            scene.get("number", scene_index + 1)
         )
 
-    max_retries = positive_int_setting(
-        config, "generation", "max_retries", 3, 1, 5
-    )
-    retry_delay = positive_int_setting(
-        config, "generation", "retry_delay_seconds", 15, 1, 120
-    )
-    aspect_ratio = get_setting(config, "images", "aspect_ratio", "16:9")
-    reference_maps = build_reference_maps(analysis)
+        story_event = (
+            as_text(scene.get("story_event"))
+            or as_text(scene.get("description"))
+            or f"Scene {scene_number}"
+        )
 
-    generated_scenes = []
-    stop_after_rate_limit = False
-
-    for index, scene in enumerate(selected_scenes, start=1):
-        scene_number = scene.get("scene_number", index)
         filename = (
-            f"scene_{index:03d}_story_{safe_filename(scene_number)}.png"
+            f"scene_{int(scene_index + 1):04d}.png"
         )
-        output_path = SCENE_DIR / filename
 
-        if stop_after_rate_limit:
-            generated_scenes.append({
-                "image_index": index,
-                "scene_number": scene_number,
-                "story_event": as_text(scene.get("story_event")),
-                "image_path": None,
-                "status": "skipped",
-                "error": "Skipped after image API rate limit.",
-            })
-            continue
+        destination = IMAGE_DIR / filename
 
-        prompt = build_prompt(
-            "scene",
+        prompt = build_scene_prompt(
             scene,
-            analysis,
-            reference_maps,
+            characters,
+            locations,
+            entities
         )
 
         try:
-            image_path = generate_image(
-                prompt=prompt,
-                output_path=output_path,
-                aspect_ratio=aspect_ratio,
-                max_retries=max_retries,
-                retry_delay=retry_delay,
-            )
-            generated_scenes.append({
-                "image_index": index,
-                "scene_number": scene_number,
-                "story_event": as_text(scene.get("story_event")),
-                "image_path": image_path,
-                "status": "success",
-            })
 
-        except ImageRateLimitError as error:
-            LOGGER.error(
-                "Image API rate limit reached. Remaining scenes will be skipped."
+            image_path = generate_image(
+                prompt,
+                destination,
+                api_key,
+                config
             )
-            generated_scenes.append({
-                "image_index": index,
+
+            scene_result = {
+
+                "image_index": image_index,
+
                 "scene_number": scene_number,
-                "story_event": as_text(scene.get("story_event")),
-                "image_path": None,
-                "status": "failed",
-                "error": str(error),
-            })
-            stop_after_rate_limit = True
+
+                "story_event": story_event,
+
+                "image_path": image_path,
+
+                "status": "success",
+
+                "animation_plan": build_animation_metadata(
+                    scene
+                ),
+            }
+
+            logger.info(
+                "Scene %s generated successfully.",
+                scene_number
+            )
+
+        except ImageRateLimitError:
+            raise
 
         except Exception as error:
-            LOGGER.exception("Scene image failed: %s", scene_number)
-            generated_scenes.append({
-                "image_index": index,
+
+            logger.exception(
+                "Scene %s generation failed.",
+                scene_number
+            )
+
+            scene_result = {
+
+                "image_index": image_index,
+
                 "scene_number": scene_number,
-                "story_event": as_text(scene.get("story_event")),
+
+                "story_event": story_event,
+
                 "image_path": None,
+
                 "status": "failed",
+
                 "error": str(error),
-            })
 
-    return generated_scenes
+                "animation_plan": build_animation_metadata(
+                    scene
+                ),
+            }
 
+        report["scene_images"].append(
+            scene_result
+        )
+
+
+# ============================================================
+# REPORT
+# ============================================================
+
+def save_report(report):
+
+    report["updated_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    save_json(
+        report,
+        REPORT_FILE
+    )
+
+    logger.info(
+        "Image generation report saved: %s",
+        REPORT_FILE
+    )
+
+
+def create_initial_report():
+
+    return {
+
+        "status": "running",
+
+        "model": OPENROUTER_IMAGE_MODEL,
+
+        "scene_images": [],
+
+        "reference_assets": [],
+
+        "pose_assets": [],
+
+        "animation_engine": "hybrid_2d_cutout",
+
+        "notes": [
+            "Scene images are flat illustrated frames.",
+            "Character pose assets are separate generated images.",
+            "Full skeletal puppet rigging is not included.",
+            "Transparent output depends on provider support.",
+            "Reference images are not automatically used as image-conditioning inputs.",
+        ],
+
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    setup_logging()
 
-    LOGGER.info("Starting OpenRouter image generation.")
-    LOGGER.info("Image model: %s", IMAGE_MODEL)
+    logger.info(
+        "Starting cinematic 2D image generation."
+    )
 
-    create_project_directories()
+    ensure_directories()
 
     config = load_config()
+
     analysis = load_analysis()
 
-    # Check the API key before deleting any previous generated assets.
-    get_api_key()
+    api_key = get_api_key()
 
-    aspect_ratio = get_setting(config, "images", "aspect_ratio", "16:9")
-    if aspect_ratio not in {
-        "1:1", "2:1", "1:2", "3:2", "2:3",
-        "4:3", "3:4", "5:4", "4:5", "16:9", "9:16", "auto",
-    }:
-        raise ValueError(
-            f"Unsupported image aspect ratio in config: {aspect_ratio}"
-        )
+    report = create_initial_report()
 
-    configured_image_count = int(
-        get_setting(config, "video", "image_count", 96)
-    )
-    if configured_image_count <= 0:
-        raise ValueError("video.image_count must be positive.")
+    save_report(report)
 
-    clean_generated_folders()
+    try:
 
-    LOGGER.info(
-        "Story: %s | Valid scenes: %s",
-        as_text(analysis.get("title"), "Untitled"),
-        len(analysis["scenes"]),
-    )
+        # Generate scene images first.
+        # This prioritizes the main video output.
 
-    # Scene images are the required assets for video editing.
-    scene_results = generate_scene_images(analysis, config)
-
-    successful = sum(
-        1 for item in scene_results if item["status"] == "success"
-    )
-    failed = sum(
-        1 for item in scene_results if item["status"] == "failed"
-    )
-    skipped = sum(
-        1 for item in scene_results if item["status"] == "skipped"
-    )
-
-    # Reference sheets are optional and are generated after scene images,
-    # so they cannot consume the scene-image request budget first.
-    references = {
-        "characters": {},
-        "locations": {},
-        "entities": {},
-    }
-    reference_failures = []
-
-    reference_sheets_enabled = get_setting(
-        config, "images", "reference_sheets", True
-    )
-    if reference_sheets_enabled:
-        references, reference_failures = generate_references(
+        generate_scene_images(
             analysis,
+            api_key,
             config,
-        )
-    else:
-        LOGGER.info("Reference-sheet generation disabled in config.")
-
-    report = {
-        "story_title": as_text(analysis.get("title"), "Untitled"),
-        "image_model": IMAGE_MODEL,
-        "provider": "OpenRouter",
-        "configured_max_scene_images": configured_image_count,
-        "max_scene_images_per_run": positive_int_setting(
-            config,
-            "generation",
-            "max_scene_images_per_run",
-            DEFAULT_MAX_SCENE_IMAGES_PER_RUN,
-            1,
-            200,
-        ),
-        "scenes_available": len(analysis["scenes"]),
-        "scene_images_requested": len(scene_results),
-        "successful_scene_images": successful,
-        "failed_scene_images": failed,
-        "skipped_scene_images": skipped,
-        "reference_images": references,
-        "reference_failures": reference_failures,
-        "scene_images": scene_results,
-    }
-
-    save_json(report, REPORT_PATH)
-
-    LOGGER.info(
-        "Scene image results: %s successful, %s failed, %s skipped.",
-        successful,
-        failed,
-        skipped,
-    )
-    LOGGER.info("Reference image failures: %s", len(reference_failures))
-    LOGGER.info("Image report saved: %s", REPORT_PATH)
-
-    if failed > 0 or skipped > 0 or successful == 0:
-        raise RuntimeError(
-            "Scene image generation incomplete: "
-            f"{successful} successful, {failed} failed, {skipped} skipped."
+            report
         )
 
-    LOGGER.info("All selected scene images generated successfully.")
+        # Optional references and poses.
+
+        images_config = config.get(
+            "images",
+            {}
+        )
+
+        generate_reference_sheets = (
+            images_config.get(
+                "reference_sheets",
+                True
+            )
+        )
+
+        if generate_reference_sheets:
+
+            generate_references(
+                analysis,
+                api_key,
+                config,
+                report
+            )
+
+        successful_scenes = sum(
+            1
+            for item in report["scene_images"]
+            if item.get("status") == "success"
+        )
+
+        failed_scenes = sum(
+            1
+            for item in report["scene_images"]
+            if item.get("status") == "failed"
+        )
+
+        if successful_scenes == 0:
+
+            raise ImageGenerationError(
+                "No scene images were generated successfully."
+            )
+
+        report["successful_scene_images"] = (
+            successful_scenes
+        )
+
+        report["failed_scene_images"] = (
+            failed_scenes
+        )
+
+        report["status"] = (
+            "completed"
+            if failed_scenes == 0
+            else "completed_with_errors"
+        )
+
+        save_report(report)
+
+        logger.info(
+            "Image generation finished. Successful: %s | Failed: %s",
+            successful_scenes,
+            failed_scenes
+        )
+
+        if failed_scenes:
+            raise ImageGenerationError(
+                f"{failed_scenes} scene image(s) failed."
+            )
+
+    except ImageRateLimitError as error:
+
+        report["status"] = "rate_limited"
+
+        report["error"] = str(error)
+
+        save_report(report)
+
+        logger.error(
+            "Image generation stopped due to rate limit."
+        )
+
+        raise
+
+    except Exception as error:
+
+        report["status"] = "failed"
+
+        report["error"] = str(error)
+
+        save_report(report)
+
+        logger.exception(
+            "Image generation failed."
+        )
+
+        raise
 
 
 if __name__ == "__main__":
