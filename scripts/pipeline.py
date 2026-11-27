@@ -43,6 +43,7 @@ STEP_OUTPUTS = {
     "Voice Generation": [
         OUTPUT_DIR / "audio" / "narration.txt",
         OUTPUT_DIR / "audio" / "narration.wav",
+        OUTPUT_DIR / "voice_generation_report.json",
     ],
     "Image Generation": [
         OUTPUT_DIR / "image_generation_report.json",
@@ -55,11 +56,23 @@ STEP_OUTPUTS = {
     ],
     "Video Editing": [
         VIDEO_FILE,
-        OUTPUT_DIR / "video_report.json",
+        OUTPUT_DIR / "video_edit_report.json",
     ],
     "Thumbnail Generation": [
         THUMBNAIL_FILE,
     ],
+}
+
+# Per-step limits prevent a stuck API request or subprocess from
+# occupying the GitHub runner indefinitely. Values are seconds.
+STEP_TIMEOUT_SECONDS = {
+    "Story Analysis": 15 * 60,
+    "Voice Generation": 35 * 60,
+    "Image Generation": 90 * 60,
+    "Sound Design": 20 * 60,
+    "Subtitle Generation": 15 * 60,
+    "Video Editing": 45 * 60,
+    "Thumbnail Generation": 15 * 60,
 }
 
 
@@ -252,6 +265,7 @@ def run_step(step_name, script_name, report):
             cwd=str(BASE_DIR),
             text=True,
             check=False,
+            timeout=STEP_TIMEOUT_SECONDS.get(step_name, 30 * 60),
         )
 
         if result.returncode != 0:
@@ -278,6 +292,27 @@ def run_step(step_name, script_name, report):
         save_report(report)
 
         print(f"\nCOMPLETED: {step_name}")
+
+    except subprocess.TimeoutExpired as error:
+        timeout_seconds = STEP_TIMEOUT_SECONDS.get(step_name, 30 * 60)
+        timeout_message = (
+            f"{step_name} exceeded its {timeout_seconds}-second "
+            "step timeout. Check this step's API retries or processing loop."
+        )
+
+        step_report["status"] = "failed"
+        step_report["error"] = timeout_message
+        step_report["finished_at"] = current_time()
+        step_report["duration_seconds"] = round(
+            time.monotonic() - start,
+            2,
+        )
+
+        report["failed_step"] = step_name
+        report["current_step"] = None
+        save_report(report)
+
+        raise RuntimeError(timeout_message) from error
 
     except Exception as error:
         step_report["status"] = "failed"
@@ -481,6 +516,10 @@ def main():
         "started_at": current_time(),
         "status": "running",
         "validation_status": "pending",
+        "runner_note": (
+            "Each production script is launched as a separate subprocess. "
+            "A step timeout prevents indefinite waiting."
+        ),
         "completed_steps": [],
         "failed_step": None,
         "current_step": None,
